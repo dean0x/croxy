@@ -277,12 +277,10 @@ const buildHealthBody = (config: Config): string =>
   });
 
 /**
- * Local error type for readBodyForRouting.  Only `client_disconnected` is an error;
- * an over-window body is a successful (ok) result — it is a routing outcome, not a
- * failure.  `body_too_large` has been removed from this union: a body that exceeds
- * the routing window on an Anthropic-bound route is forwarded as a stream; only a
- * body that exceeds the window on a translated route (where subswitch is the origin)
- * produces a 413.  The 413 is emitted in the dispatch switch, not here.
+ * Local error type for readBodyForRouting.  The only failure is `client_disconnected`.
+ * An over-window body is a successful (ok) result: it is a routing outcome, not a
+ * failure.  The 413 for translated-route over-window bodies is emitted in the dispatch
+ * switch, not here, keeping readBodyForRouting protocol-agnostic.
  *
  * Deliberately excluded from ProxyError so proxyErrorToAnthropic can never
  * accidentally be called with it.  The compiler enforces this: any future code path
@@ -319,9 +317,7 @@ type IngestedBody =
  *      forwarded), pause the stream, detach listeners in the same tick, settle as
  *      over_window.  Buffered bytes are retained across pause and delivered by pipe().
  *
- * Replaced bufferBody which unconditionally produced body_too_large on over-window
- * bodies.  That made the relay synthesize a 413 for every large Anthropic-bound body —
- * an ADR-010 violation: the relay invented a status the origin never sent.
+ * Invariant: peak buffered bytes per request ≤ window + one socket read.
  */
 const readBodyForRouting = (req: IncomingMessage, windowBytes: number): Promise<Result<IngestedBody, IngestError>> =>
   new Promise((resolve) => {
@@ -362,6 +358,7 @@ const readBodyForRouting = (req: IncomingMessage, windowBytes: number): Promise<
         req.off("end", onEnd);
         req.off("error", onError);
         settle(ok({ kind: "over_window", prefix: Buffer.concat(chunks) }));
+        chunks.length = 0; // release chunk array; concatenated prefix is now the sole reference
         return;
       }
     };
@@ -409,6 +406,7 @@ export const createProxyServer = (deps: ServerDeps): Server => {
     const pathname = path.split("?")[0] ?? path;
     let model: string | undefined;
     let route = "anthropic";
+    let bodyMode: "buffered" | "streamed" | undefined;
 
     res.on("close", () => {
       // One record per request, and only one of the two shapes.  When no response
@@ -428,6 +426,7 @@ export const createProxyServer = (deps: ServerDeps): Server => {
         path: pathname,
         route,
         ...(model !== undefined ? { model } : {}),
+        ...(bodyMode !== undefined ? { bodyMode } : {}),
         status: res.statusCode,
         latencyMs: Date.now() - startedAt,
       });
@@ -527,11 +526,13 @@ export const createProxyServer = (deps: ServerDeps): Server => {
         // operators can grep for what the client typed (a typo like "sol" not "sool").
         model = peekModel(parsedBody);
         forwardBody = { kind: "complete", bytes: ingest.value.body };
+        bodyMode = "buffered";
       } else {
         // over_window: scan the prefix for the model key.
         // JSON.parse is not available — the body is not fully buffered.
         model = sniffLeadingModel(ingest.value.prefix);
         forwardBody = { kind: "prefix", bytes: ingest.value.prefix };
+        bodyMode = "streamed";
       }
 
       // Resolve the model name once before routing (ADR-005: resolution strictly before dispatch).
@@ -546,7 +547,13 @@ export const createProxyServer = (deps: ServerDeps): Server => {
           // per ADR-010: a relay-synthesized 413 for a body the origin would have
           // accepted is a status the origin never emits.  Anthropic enforces its own
           // payload limits with authoritative errors; we must not invent one first.
-          if (ingest.value.kind === "over_window") route = "anthropic:streamed";
+          if (ingest.value.kind === "over_window") {
+            // Distinguish sniff-resolved from fail-open for post-hoc log analysis.
+            // "anthropic:streamed" means the prefix contained a recognized model key.
+            // "anthropic:streamed:unsniffed" means the key was absent or beyond the sniff
+            // window — the relay fails open to Anthropic per ADR-010.
+            route = model !== undefined ? "anthropic:streamed" : "anthropic:streamed:unsniffed";
+          }
           deps.forwardAnthropic(req, res, forwardBody);
           return;
         }
@@ -635,6 +642,9 @@ export const createProxyServer = (deps: ServerDeps): Server => {
       } else if (!res.writableEnded) {
         res.destroy();
       }
+      // If the body was paused mid-upload (over_window path) when dispatch() threw,
+      // resume and discard it so the socket is not left wedged.
+      drainRejectedUpload(req);
     });
   });
 
