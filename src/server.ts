@@ -503,7 +503,7 @@ export const createProxyServer = (deps: ServerDeps): Server => {
           default: {
             // Exhaustive check — a new IngestError variant is a compile error here
             // rather than a request that returns nothing and is logged as a success.
-            const _exhaustive: never = ingest.error;
+            const _exhaustive: never = ingest.error.kind;
             void _exhaustive;
             return;
           }
