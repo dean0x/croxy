@@ -23,6 +23,10 @@ export interface LogFields {
    *  Verifies key stability across turns without revealing the full key.
    *  Truncated: non-reversible. */
   readonly sessionKey?: string;
+  /** How the request body was handled for routing.
+   *  "buffered"  — body fit within the routing window; fully read before dispatch.
+   *  "streamed"  — body exceeded the window; prefix sniffed, remainder piped to upstream. */
+  readonly bodyMode?: string;
 }
 
 export interface Logger {
@@ -42,6 +46,7 @@ export const FIELD_KEYS = [
   "effort",
   "cachedTokens",
   "sessionKey",
+  "bodyMode",
 ] as const satisfies readonly (keyof LogFields)[];
 // Completeness proof lives in test/unit/logger.types.test.ts (module-level type
 // proofs follow the *.types.test.ts convention; in-src guards are function-local

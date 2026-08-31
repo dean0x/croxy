@@ -8,7 +8,7 @@
  * ---------------------------------------------------------------------------
  * MEASURED NUMBERS — 2026-08-19, Apple M1 Max (darwin-arm64, 64 GiB), Node v22.22.3
  * ---------------------------------------------------------------------------
- * CONCURRENCY=32, BODY_MIB=32 (= the configured `limits.maxBodyBytes`), all 32 uploads
+ * CONCURRENCY=32, BODY_MIB=32 (= the configured `limits.maxBufferedBodyBytes`), all 32 uploads
  * parked at the fake origin, proxy alone in a child process, 25 ms in-flight sampling,
  * no forced GC:
  *
@@ -24,7 +24,7 @@
  * is otherwise linear in body size, which is why the ceiling below is a multiplier.
  *
  * At that cost, 2 GiB of RSS growth is crossed at ~31–32 concurrent requests, every one
- * of them at the full 32 MiB `limits.maxBodyBytes`. The previous version of this header
+ * of them at the full 32 MiB `limits.maxBufferedBodyBytes`. The previous version of this header
  * claimed ~683; that figure came from a snapshot taken after `Promise.allSettled` and
  * after a `global.gc()` that was a silent no-op without `--expose-gc`, in a process
  * shared with its own load generator, using a payload that never parsed as JSON — it
@@ -32,7 +32,7 @@
  *
  * On amplification: it is ~2x here, not the ~3x reported from shared-process harnesses.
  * The buffered chunk list and the `Buffer.concat` result are both live at the same
- * moment in `bufferBody` (src/server.ts), and the UTF-8 string plus the parsed object
+ * moment in `readBodyForRouting` (src/server.ts), and the UTF-8 string plus the parsed object
  * graph supply the heap term (+4.0 MiB/request). It is decidedly not 1x, so wire size
  * alone is not the memory cost.
  *
@@ -40,7 +40,7 @@
  * aggregate in-flight bound; that is a deployment-envelope decision recorded in
  * ADR-010. subswitch is a single local user running tens of concurrent agents, real
  * Claude Code request bodies are orders of magnitude below the 32 MiB ceiling, and
- * `limits.maxBodyBytes` bounds each request individually — there is deliberately no
+ * `limits.maxBufferedBodyBytes` bounds each request individually — there is deliberately no
  * aggregate bound. The numbers above are the worst case (every agent simultaneously
  * at the ceiling), not the expected case, and ADR-010 requires any bound to be
  * justified by measurement at the actual deployment shape rather than by a benchmark
@@ -76,7 +76,7 @@
  *
  *   CONCURRENCY          simultaneous in-flight uploads          (default 32)
  *   BODY_MIB             wire body size per request, MiB         (default: the
- *                        configured `limits.maxBodyBytes`, i.e. run at the ceiling)
+ *                        configured `limits.maxBufferedBodyBytes`, i.e. run at the ceiling)
  *   CEILING_MIB_PER_REQ  fail the run above this peak RSS cost   (default:
  *                        BODY_MIB × PEAK_AMPLIFICATION_CEILING, see below)
  *
@@ -329,7 +329,7 @@ const runProxyChild = async (): Promise<void> => {
   // Parent gone: never linger holding a port.
   process.on("disconnect", () => shutdown(0));
 
-  send({ kind: "ready", port, maxBodyBytes: config.limits.maxBodyBytes });
+  send({ kind: "ready", port, maxBodyBytes: config.limits.maxBufferedBodyBytes });
 };
 
 // ===========================================================================
@@ -525,7 +525,7 @@ const runBench = async (): Promise<number> => {
   }
   const { port: proxyPort, maxBodyBytes } = ready.value;
 
-  // Default body size IS the configured ceiling: run at limits.maxBodyBytes.
+  // Default body size IS the configured ceiling: run at limits.maxBufferedBodyBytes.
   const bodyMibResult = numberFromEnv("BODY_MIB", maxBodyBytes / MIB);
   if (!bodyMibResult.ok) {
     console.error(bodyMibResult.error);
@@ -560,8 +560,15 @@ const runBench = async (): Promise<number> => {
   console.log();
 
   if (bodyBytes > maxBodyBytes) {
-    console.error(`BODY_MIB exceeds limits.maxBodyBytes — the relay will answer 413 and the run will fail.`);
-    return finish(1);
+    // For Anthropic-bound traffic, over-window bodies are now streamed (not 413'd).
+    // This bench targets the buffered path (complete bodies within the window), so
+    // results for over-window runs measure the prefix-buffer profile rather than the
+    // full-buffer profile.  Warn and continue rather than abort.
+    console.warn(
+      `BODY_MIB (${bodyMib.toFixed(1)}) exceeds limits.maxBufferedBodyBytes (${formatMiB(maxBodyBytes)}).` +
+        " Anthropic-bound traffic will be streamed (only MODEL_SNIFF_BYTES prefix buffered)." +
+        " Memory numbers reflect the streaming profile, not the fully-buffered baseline.",
+    );
   }
 
   const agent = new http.Agent({ keepAlive: false, maxSockets: concurrency + 4 });

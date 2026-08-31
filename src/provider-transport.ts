@@ -118,12 +118,17 @@ export const readBoundedText = async (body: Response["body"], maxBytes: number):
  * pushes ~1 GB through the drain in ~215 ms, so a 2 s window admits gigabytes per
  * rejected request.  REJECTED_UPLOAD_DRAIN_BYTES is what makes the volume finite.
  *
- * 32 MiB is the default `limits.maxBodyBytes` — the largest body the relay would
- * have accepted — so a client that merely overshot the cap is never cut off
- * mid-drain.  It is deliberately a constant rather than the configured maxBodyBytes:
- * an operator who lowers the cap to, say, 1 MiB would otherwise have the relay
- * destroy the socket of every client with more than 1 MiB still in flight, which is
- * the RST this helper exists to prevent.
+ * 32 MiB is the default `limits.maxBufferedBodyBytes` — the largest body the relay
+ * would have buffered for routing on the translated leg — so a client that merely
+ * overshot the cap is never cut off mid-drain.  It is deliberately a constant rather
+ * than the configured maxBufferedBodyBytes: an operator who lowers the cap to, say,
+ * 1 MiB would otherwise have the relay destroy the socket of every client with more
+ * than 1 MiB still in flight, which is the RST this helper exists to prevent.
+ *
+ * The 413-producing callers are the inbound host-gate 403 path and the translated-route
+ * 413 path in server.ts.  The Anthropic passthrough paths (connect-timeout 504 and
+ * upstream-error 502) also call this helper on the streaming (prefix) path.  All four
+ * callers leave the socket with unread inbound bytes that need draining.
  *
  * The two bounds are pinned by opposite controls: B7 asserts a slow client is closed
  * between 1.5 s and 3 s (time), B10 asserts a line-rate client stops being read far
@@ -137,9 +142,10 @@ const REJECTED_UPLOAD_DRAIN_BYTES = 32 * 1024 * 1024;
  * rather than RST, and so the connection is reclaimed rather than wedged.
  *
  * Call this wherever the relay answers a request whose upload is still in flight and
- * whose body it will never read: the inbound 413 and the loopback-gate 403 in
- * server.ts, and the connect-timeout 504 and upstream-error 502 on the Anthropic leg's
- * unbuffered path.  Every one of them leaves the socket with unread inbound bytes.
+ * whose body it will never read: the translated-route 413 and the loopback-gate 403
+ * in server.ts, and the connect-timeout 504 and upstream-error 502 on the Anthropic
+ * leg's streaming (prefix) path.  Every one of them leaves the socket with unread
+ * inbound bytes.
  * Destroying it then makes the kernel send RST and the client may discard the response
  * it had already received; leaving it alone is no better — Node cannot parse the next
  * request out of a body it never consumed, so the connection is held until

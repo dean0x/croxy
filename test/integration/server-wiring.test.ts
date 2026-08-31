@@ -111,7 +111,7 @@ describe("makeMinimalConfig — non-vacuity guard", () => {
     //   port:                              4141   (DEFAULT_PORT)
     //   anthropic.connectTimeoutMs:        10_000
     //   anthropic.maxUpstreamSockets:      256
-    //   limits.maxBodyBytes:               33_554_432  (32 MiB)
+    //   limits.maxBufferedBodyBytes:       33_554_432  (32 MiB)
     //   limits.pingIntervalMs:             15_000
     //   providers.codex.aliases:           {}
     //   providers.codex.requestTimeoutMs:  600_000
@@ -120,7 +120,7 @@ describe("makeMinimalConfig — non-vacuity guard", () => {
     assert.equal(fixture.port, 4141, "port default must be 4141 (DEFAULT_PORT)");
     assert.equal(fixture.anthropic.connectTimeoutMs, 10_000, "anthropic.connectTimeoutMs default must be 10 000 ms");
     assert.equal(fixture.anthropic.maxUpstreamSockets, 256, "anthropic.maxUpstreamSockets default must be 256");
-    assert.equal(fixture.limits.maxBodyBytes, 32 * 1024 * 1024, "limits.maxBodyBytes default must be 32 MiB");
+    assert.equal(fixture.limits.maxBufferedBodyBytes, 32 * 1024 * 1024, "limits.maxBufferedBodyBytes default must be 32 MiB");
     assert.equal(fixture.limits.pingIntervalMs, 15_000, "limits.pingIntervalMs default must be 15 000 ms");
     assert.deepEqual(fixture.providers.codex.aliases, {}, "providers.codex.aliases default must be empty");
     assert.equal(fixture.providers.codex.requestTimeoutMs, 600_000, "providers.codex.requestTimeoutMs default must be 600 000 ms");

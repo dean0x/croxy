@@ -60,7 +60,7 @@ node --import tsx --test --test-timeout=30000 "test/unit/*.test.ts" "test/integr
   `npm run bench:memory`. The memory bench runs the relay in a child process, parks
   concurrent uploads at a fake origin, samples peak in-flight memory, and exits
   non-zero if peak per-request RSS exceeds its ceiling. It defaults to
-  `limits.maxBodyBytes` bodies and takes the `CONCURRENCY`, `BODY_MIB` and
+  `limits.maxBufferedBodyBytes` bodies and takes the `CONCURRENCY`, `BODY_MIB` and
   `CEILING_MIB_PER_REQ` env knobs, e.g.
   `CONCURRENCY=16 BODY_MIB=8 npm run bench:memory`.
   At its defaults it allocates several GiB; it is not part of CI.

@@ -26,7 +26,7 @@
     }
   },
   "limits": {
-    "maxBodyBytes": 33554432,
+    "maxBufferedBodyBytes": 33554432,
     "pingIntervalMs": 15000
   }
 }

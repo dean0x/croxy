@@ -3,7 +3,7 @@
  *   F7  — ambiguous family name → fail-open (forwarded to Anthropic), warn log carries provider list
  *   F6g — unknown provider qualifier → fail-open (forwarded to Anthropic, not 400)
  *   L1  — colon-bearing unknown model name routes to Anthropic (not 400); real codex: prefix still works
- *   L4  — oversized body returns 413 with type "request_too_large" (matches Anthropic taxonomy)
+ *   L4  — over-window body: Codex route → 413 request_too_large; Anthropic route → forwarded
  *   P2  — routing table built once: ≥2 requests route consistently without per-request rebuilds
  *         Verified via Proxy ownKeys trap on the aliases map (production resolver, no synthetic seam).
  *
@@ -261,11 +261,13 @@ describe("routing — unknown provider qualifier fails open to Anthropic (F6g / 
 });
 
 // ---------------------------------------------------------------------------
-// L4: oversized body → 413 with type "request_too_large"
+// L4: oversized body handling — translated route gets 413; Anthropic route streams
 // ---------------------------------------------------------------------------
 
-describe("routing — oversized body returns request_too_large (L4)", () => {
-  it("returns 413 with error type 'request_too_large' for a body exceeding maxBodyBytes", async () => {
+describe("routing — over-window body handling (L4)", () => {
+  it("(a) a Codex body over the window returns 413 with type 'request_too_large'; neither upstream is contacted", async () => {
+    // Non-vacuity: RED against the old path that always returned 413 for over-window
+    // bodies regardless of route — the test verifies the route-specific 413.
     const cleanups: Array<() => Promise<void>> = [];
 
     const anthropic = await startFakeUpstream((_req, res) => {
@@ -274,15 +276,16 @@ describe("routing — oversized body returns request_too_large (L4)", () => {
     });
     cleanups.push(anthropic.close);
 
-    // maxBodyBytes: 64 bytes — tiny, so we can trigger the limit easily.
+    // maxBufferedBodyBytes: 64 bytes — tiny, so we can trigger the limit easily.
     const subswitch = await startSubswitch({
       anthropic: { baseUrl: anthropic.url },
-      limits: { maxBodyBytes: 64 },
+      limits: { maxBufferedBodyBytes: 64 },
     });
     cleanups.push(subswitch.close);
 
     try {
-      const oversizedBody = Buffer.alloc(128, "x"); // 128 > 64 → triggers 413
+      // Codex model as the first JSON key so the sniff identifies it as a translated route.
+      const oversizedBody = `{"model":"codex:gpt-5.6-sol","pad":"${"x".repeat(128)}"}`;
       const response = await fetch(`${subswitch.url}/v1/messages`, {
         method: "POST",
         headers: {
@@ -293,7 +296,7 @@ describe("routing — oversized body returns request_too_large (L4)", () => {
         body: oversizedBody,
       });
 
-      assert.equal(response.status, 413, "oversized body must return 413");
+      assert.equal(response.status, 413, "oversized Codex body must return 413");
       const body = (await response.json()) as { type: string; error: { type: string; message: string } };
       assert.equal(body.type, "error", "response type must be 'error'");
       assert.equal(
@@ -301,8 +304,49 @@ describe("routing — oversized body returns request_too_large (L4)", () => {
         "request_too_large",
         "413 error type must be 'request_too_large', not 'invalid_request_error'",
       );
-      // Must NOT reach the upstream — the relay caps before forwarding.
-      assert.equal(anthropic.requests.length, 0, "oversized body must not reach the upstream");
+      assert.equal(response.headers.get("x-subswitch-synthesized"), "1", "413 must carry synthesized marker");
+      // Neither upstream is contacted — the relay rejects on its own authority.
+      assert.equal(anthropic.requests.length, 0, "Anthropic upstream must not receive the oversized translated body");
+    } finally {
+      for (const cleanup of cleanups.reverse()) await cleanup();
+    }
+  });
+
+  it("(b) an Anthropic body over the window is forwarded to the origin, not rejected", async () => {
+    // Non-vacuity: RED against the old path that always returned 413 for over-window
+    // bodies — this test fails on the old code because the relay synthesizes 413.
+    const cleanups: Array<() => Promise<void>> = [];
+
+    const anthropic = await startFakeUpstream((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "msg_from_anthropic" }));
+    });
+    cleanups.push(anthropic.close);
+
+    const subswitch = await startSubswitch({
+      anthropic: { baseUrl: anthropic.url },
+      limits: { maxBufferedBodyBytes: 64 },
+    });
+    cleanups.push(subswitch.close);
+
+    try {
+      // Non-JSON body — peekModel returns undefined → decideRoute → Anthropic.
+      // The body is larger than the 64-byte window, so it would have been rejected
+      // under the old code.
+      const oversizedBody = Buffer.alloc(128, "x");
+      const response = await fetch(`${subswitch.url}/v1/messages`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer sk-ant",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: oversizedBody,
+      });
+
+      assert.equal(response.status, 200, "Anthropic-bound over-window body must be forwarded, not rejected");
+      assert.equal(response.headers.get("x-subswitch-synthesized"), null, "forwarded response must not carry synthesized marker");
+      assert.equal(anthropic.requests.length, 1, "the body must reach the Anthropic upstream");
     } finally {
       for (const cleanup of cleanups.reverse()) await cleanup();
     }

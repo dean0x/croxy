@@ -58,7 +58,7 @@ Both `logger.ts` and `cli.ts` import this function. `FORCE_COLOR=0` and `FORCE_C
 **Current `Config` shapes (post-ADR-010 hardening):**
 
 - `Config.anthropic`: `{ baseUrl, connectTimeoutMs, maxUpstreamSockets, allowInsecureBaseUrl }`. The `headerTimeoutMs` and `streamIdleTimeoutMs` fields were **removed** — the relay must never bound the headers or stream-idle phase on a connected client (ADR-010).
-- `Config.limits`: `{ maxBodyBytes, pingIntervalMs }`. The admission-gate fields (`maxConcurrentRequests`, `maxInFlightBytes`, `maxQueueDepth`, `maxQueueWaitMs`) were **removed** — the byte-budget gate was an ADR-010 violation.
+- `Config.limits`: `{ maxBufferedBodyBytes, pingIntervalMs }`. Renamed from `maxBodyBytes` (v0.4.0 BREAKING; `LEGACY_KEY_ENTRIES` covers migration). The admission-gate fields (`maxConcurrentRequests`, `maxInFlightBytes`, `maxQueueDepth`, `maxQueueWaitMs`) were **removed** — the byte-budget gate was an ADR-010 violation.
 
 **`resolveConfig` builds `anthropic` and `limits` field-by-field** (not by spreading `file.anthropic` or `file.limits`) so removed keys cannot accidentally reach the runtime `Config` even if the schema were to parse them.
 
@@ -134,22 +134,28 @@ Per-command flag validation walks `parseArgs` **tokens**, not `values`. The main
 1. `res.on("close", …)` listener registered first — must be the earliest hook.
 2. `hostGateVerdict(req.headers)` — foreign Host → 403 + `drainRejectedUpload(req)` + return.
 3. `/__subswitch/*` namespace — handled locally, never forwarded.
-4. `bufferBody(req, limits.maxBodyBytes)` — rejects early if `Content-Length` header exceeds the cap (before reading a byte); otherwise streams and rejects once the byte count crosses the cap.
-5. Exhaustive `BufferBodyError` switch:
-   - `body_too_large` → 413 `request_too_large` + `drainRejectedUpload(req)`.
+4. `readBodyForRouting(req, limits.maxBufferedBodyBytes)` — reads up to the window. Returns discriminated `IngestedBody`: `complete` (body fits) or `over_window` (body exceeded cap, prefix held). `IngestError` has one variant: `client_disconnected`.
+5. Exhaustive `IngestError` switch:
    - `client_disconnected` → no response (client gone; logged by the close handler already).
+6. Over-window routing:
+   - Anthropic-bound → sniff prefix for model key → `anthropic:streamed` (model found) or `anthropic:streamed:unsniffed` (fail-open); stream body to upstream; no 413.
+   - Translated provider → 413 `request_too_large` + `drainRejectedUpload(req)` (relay is origin here).
 
 **`client_disconnected` log event.** When `res.close` fires with `!res.headersSent`, the handler logs `info client_disconnected { path, route, model?, latencyMs }` instead of `request_complete`. This is correct: `res.statusCode` is Node's 200 initialiser when no response has been sent, so `request_complete status=200` would make a vanished client indistinguishable from a served request. `res` "close" fires **before** `req` "error" on Node 22 — the decision must live in the `close` handler.
 
 **Route log labels.** `route` defaults to `"anthropic"` and is updated before dispatch:
 - `"host_rejected"` — foreign Host gate fired.
+- `"anthropic:streamed"` — over-window body; sniff resolved model key; body piped to upstream.
+- `"anthropic:streamed:unsniffed"` — over-window body; model key not in prefix; fail-open to Anthropic (ADR-010).
 - `"anthropic:ambiguous"` — `resolveModel` returned `"ambiguous"`; fails open (ADR-010).
 - `"anthropic:fallback"` — `resolveModel` returned `"unknown_qualifier"`; fails open (ADR-010).
 - `"{provider}:{endpoint}:{model}"` — routed to a configured provider.
 - `"internal_error"` — unhandled `dispatch()` rejection.
 - Retired values (no producer): `"rate_limited"`, `"ambiguous"`, `"unknown_provider"`.
 
-**`BufferBodyError`** (module-local type): `{ kind: "body_too_large" } | { kind: "client_disconnected" }`. Intentionally excluded from `ProxyError` so `proxyErrorToAnthropic` can never accidentally be called with them — any attempt is a compile error.
+**`bodyMode` log field** (optional string): `"buffered"` (complete path — full body in window) or `"streamed"` (over_window path — prefix sniffed, remainder piped). Present on `request_complete` log events whenever the body was processed.
+
+**`IngestError`** (module-local type, `server.ts`): `{ kind: "client_disconnected"; message: string }`. Single variant — `body_too_large` was removed; over-window Anthropic bodies are streamed, not rejected. Intentionally excluded from `ProxyError` so `proxyErrorToAnthropic` can never be called with it — any attempt is a compile error.
 
 **Byte-budget admission gate is GONE.** The old `inFlightBytes`, `queue`, `acquireSlot`, `drainQueue`, `releaseSlot`, `getReservationBytes`, `SlotError`, `QueueEntry`, and the synthesized 529/`rate_limited`/`disconnected_while_queued` labels were all removed as ADR-010 violations.
 
@@ -157,9 +163,10 @@ Per-command flag validation walks `parseArgs` **tokens**, not `values`. The main
 
 ### src/provider-transport.ts — Shared transport helpers
 
-**`drainRejectedUpload(req)`** (exported): drains an in-flight upload after a rejection response has been sent, so the socket closes with FIN rather than RST (which can cause the client to discard the already-sent response). Bounds: 2-second unref'd timer (`REJECTED_UPLOAD_DRAIN_MS = 2_000`) + 32 MiB byte cap (`REJECTED_UPLOAD_DRAIN_BYTES = 32 * 1024 * 1024`). Four callers:
+**`drainRejectedUpload(req)`** (exported): drains an in-flight upload after a rejection response has been sent (or when dispatch() throws), so the socket closes with FIN rather than RST. Bounds: 2-second unref'd timer (`REJECTED_UPLOAD_DRAIN_MS = 2_000`) + 32 MiB byte cap (`REJECTED_UPLOAD_DRAIN_BYTES = 32 * 1024 * 1024`). Five callers:
 - `server.ts` host-gate 403 path.
-- `server.ts` 413 `body_too_large` path.
+- `server.ts` 413 translated-provider over-window path.
+- `server.ts` `dispatch().catch` — resumes paused req when dispatch() throws after over_window trip.
 - `anthropic-passthrough.ts` unbuffered 504 (upstream timeout) path.
 - `anthropic-passthrough.ts` unbuffered 502 (upstream error) path.
 
@@ -292,9 +299,9 @@ Emits to stderr. Format: `[HH:MM:SS] level=<L> event=<E> key=value …`. Fields 
 - `src/provider-events.ts` — `providerEvents<P extends ProviderId>`; template-literal `ProviderEvents<P>`; 19-field table; compile-time log-injection control
 - `src/logger.ts` — `createConsoleLogger`; `FIELD_KEYS` bidirectional completeness check; `renderToken` strips all C0/DEL/C1 control characters then quotes — applied to values AND event token
 - `src/inbound-policy.ts` — `SERVER_TUNING` (exported); `applyInboundPolicy(server, logger)` (single entry point — applies tuning AND registers `clientError` handler); `appliedServers` WeakSet (idempotency guard); `hostGateVerdict(headers)` (pure, exported — wire-side Host/Origin gate); `responseForClientError(code)` (Object.hasOwn, prototype-safe); `writtenAtLastResponse` WeakMap (per-request reply guard, snapshots `socket.bytesWritten` at each response finish)
-- `src/server.ts` — `buildDeps(config, logger?)` — the one wiring site; `BufferBodyError` (module-local); dispatch order: close listener → host gate → namespace → bufferBody → exhaustive error switch; `client_disconnected` log event for headerless close; `anthropic:ambiguous`/`anthropic:fallback` route labels
-- `src/provider-transport.ts` — `drainRejectedUpload(req)` (exported; 2 s + 32 MiB bounds; 4 callers); `respondJson(res, status, body, extraHeaders?)` (extraHeaders spread before marker so marker always wins)
-- `src/errors.ts` — `ProxyError` (no `body_too_large`/`client_disconnected`); `AnthropicErrorType` (includes `not_found_error`; `overloaded_error` removed); `SYNTHESIZED_HEADER`/`SYNTHESIZED_MARKER` single chokepoint
+- `src/server.ts` — `buildDeps(config, logger?)` — the one wiring site; `IngestError` (module-local, single variant `client_disconnected`); dispatch order: close listener → host gate → namespace → `readBodyForRouting` → exhaustive error switch → over-window routing → provider dispatch; `client_disconnected` log event for headerless close; `bodyMode` field (`buffered`/`streamed`); `anthropic:streamed`/`anthropic:streamed:unsniffed`/`anthropic:ambiguous`/`anthropic:fallback` route labels
+- `src/provider-transport.ts` — `drainRejectedUpload(req)` (exported; 2 s + 32 MiB bounds; 5 callers); `respondJson(res, status, body, extraHeaders?)` (extraHeaders spread before marker so marker always wins)
+- `src/errors.ts` — `ProxyError` (no `client_disconnected`); `AnthropicErrorType` (includes `not_found_error`; `overloaded_error` removed); `SYNTHESIZED_HEADER`/`SYNTHESIZED_MARKER` single chokepoint
 - `src/doctor.ts` — `runDoctor`; `PROVIDER_AUTH_INSPECTORS` (exported totality anchor); `makeLiveListAgentFiles` (absolute-path resolution critical)
 - `src/init.ts` — Pure planning + `InitFsDeps` / `InitPrompts` seams; wizard prompts only port + settings-target
 - `src/agent-scan.ts` — `parseFrontmatterModel`; `checkAgentModels`; `unknown_provider` severity `"info"` (ADR-010)

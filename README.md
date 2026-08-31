@@ -289,7 +289,7 @@ All keys and their defaults:
 | `providers.codex.maxSseEventBytes` | `4194304` (4 MiB) | Maximum bytes per individual SSE event from the Codex upstream |
 | `providers.codex.maxAggregateBytes` | `67108864` (64 MiB) | Maximum total accumulated frame bytes for non-streaming response aggregation; exceeding this returns 502 |
 | `providers.codex.allowInsecureBaseUrl` | `false` | **Security opt-in** — when false (the default), `subswitch serve` refuses to start if `providers.codex.baseUrl` or `providers.codex.oauthTokenUrl` points at a host other than `chatgpt.com` or `auth.openai.com`. This prevents credential forwarding to an untrusted host. Set to `true` only when routing through a trusted proxy. Loopback addresses are always exempt. |
-| `limits.maxBodyBytes` | `33554432` (32 MiB) | Maximum request body bytes buffered before the routing decision |
+| `limits.maxBufferedBodyBytes` | `33554432` (32 MiB) | Maximum request body bytes the relay buffers. A larger body is streamed to Anthropic unmodified; on a translated (Codex) route it is answered `413 request_too_large`. |
 | `limits.pingIntervalMs` | `15000` (15 s) | Interval between SSE ping frames sent to clients during long Codex streams |
 
 > **Why `connectTimeoutMs` and `maxUpstreamSockets` are Anthropic-leg-only**: the
@@ -304,6 +304,14 @@ All keys and their defaults:
 > warm-up. (2) **TLS negotiation is not covered.** On `https://api.anthropic.com`,
 > the budget ends when the TCP connection is established (`'connect'` event); the TLS
 > handshake occurs after and is not bounded by this knob.
+
+> **BREAKING (0.4.0):** `limits.maxBodyBytes` has been renamed to
+> `limits.maxBufferedBodyBytes`. If your config contains `limits.maxBodyBytes`, subswitch
+> will refuse to start and print a message naming the replacement key. Rename the key to
+> continue. Additionally, the cap no longer applies to Anthropic-bound request bodies:
+> a body above the window is now streamed to `api.anthropic.com` verbatim instead of
+> being answered with a relay-synthesized `413 request_too_large`, because Anthropic
+> enforces its own payload limits with authoritative errors.
 
 > **BREAKING (0.3.0):** Two config keys were removed: `anthropic.streamIdleTimeoutMs`
 > and `limits.maxConcurrentRequests`. If your config contains either of these,
@@ -332,10 +340,15 @@ subswitch configures its inbound `http.Server` with the following fixed values:
 | `maxRequestsPerSocket` | `0` (unlimited) | Prevents connection cycling on long-lived agents |
 | `maxHeaderSize` | `65 536` bytes (64 KiB) | Anthropic's own limit; subswitch returns a `431 Request Header Fields Too Large` (Anthropic-shaped) when exceeded |
 
-When a client sends a request body larger than `limits.maxBodyBytes`, subswitch returns
-413 and then **drains the remaining upload bytes** before closing the connection. This
-lets the client read the 413 response; without the drain, the TCP write-buffer fills and
-the client's `recv()` never sees the 413 body.
+When a client sends a body larger than `limits.maxBufferedBodyBytes` to a translated
+(Codex) route, subswitch returns 413 and then **drains the remaining upload bytes** before
+closing the connection. This lets the client read the 413 response; without the drain, the
+TCP write-buffer fills and the client's `recv()` never sees the 413 body. For
+Anthropic-bound bodies above the window, subswitch streams the body verbatim and Anthropic
+enforces its own payload limits with authoritative errors. Note that to route an over-window
+body the relay must read enough bytes to identify the model; a client that declares a large
+Content-Length and then dribbles data slowly will hold the connection open until
+`server.requestTimeout` (10 min) — this is inherent to needing the model name for routing.
 
 ### Token counting on the Codex leg
 

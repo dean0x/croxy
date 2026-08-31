@@ -384,7 +384,7 @@ export const createCodexHandler = <P extends ProviderId>(deps: CodexHandlerDeps<
             framesBytes += frame.length;
             // RELI-06: bound the accumulation buffer before aggregateFrames materialises
             // the turn. Every other buffer on this path is bounded (maxEventBytes,
-            // maxBodyBytes, MAX_CONTENT_BLOCKS); this is the one that was not.
+            // maxBufferedBodyBytes, MAX_CONTENT_BLOCKS); this is the one that was not.
             // Exceeding the cap is reported as a pipeline failure — the same 502
             // "stream interrupted" shape as any other midstream abort. We must never
             // pass a truncated frames array to aggregateFrames, which would produce a
