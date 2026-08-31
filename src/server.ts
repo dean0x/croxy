@@ -8,7 +8,8 @@ import { aliasesByProvider, enumerateDestinations, isLoopbackHost, providerConfi
 import { createConsoleLogger, type Logger } from "./logger.js";
 import { providerEvents } from "./provider-events.js";
 import { decideRoute } from "./router.js";
-import { createAnthropicForwarder, type AnthropicForwarder } from "./anthropic-passthrough.js";
+import { createAnthropicForwarder, type AnthropicForwarder, type ForwardedBody } from "./anthropic-passthrough.js";
+import { sniffLeadingModel, MODEL_SNIFF_BYTES } from "./anthropic-parse.js";
 import { CodexAuthManager, createFsAuthFileStore } from "./codex-auth.js";
 import type { ProviderAuth } from "./provider-auth.js";
 import { ReasoningCache } from "./reasoning-cache.js";
@@ -276,72 +277,105 @@ const buildHealthBody = (config: Config): string =>
   });
 
 /**
- * Local error type for bufferBody. These errors are handled entirely within server.ts:
- *   - body_too_large: synthetic 413 is sent, then drainRejectedUpload() lets TCP close cleanly.
- *   - client_disconnected: client is gone — no HTTP response is possible.
+ * Local error type for readBodyForRouting.  Only `client_disconnected` is an error;
+ * an over-window body is a successful (ok) result — it is a routing outcome, not a
+ * failure.  `body_too_large` has been removed from this union: a body that exceeds
+ * the routing window on an Anthropic-bound route is forwarded as a stream; only a
+ * body that exceeds the window on a translated route (where subswitch is the origin)
+ * produces a 413.  The 413 is emitted in the dispatch switch, not here.
  *
- * Both variants are deliberately excluded from ProxyError so proxyErrorToAnthropic
- * can never accidentally be called with them. The compiler enforces this: any future
- * code path that tries to pass a BufferBodyError into proxyErrorToAnthropic will fail
- * to type-check.
+ * Deliberately excluded from ProxyError so proxyErrorToAnthropic can never
+ * accidentally be called with it.  The compiler enforces this: any future code path
+ * that tries to pass an IngestError into proxyErrorToAnthropic will fail to type-check.
  */
-type BufferBodyError =
-  | { readonly kind: "body_too_large"; readonly message: string }
-  | { readonly kind: "client_disconnected"; readonly message: string };
+type IngestError = { readonly kind: "client_disconnected"; readonly message: string };
 
-const bufferBody = (req: IncomingMessage, maxBytes: number): Promise<Result<Buffer, BufferBodyError>> =>
+/**
+ * What readBodyForRouting hands back on success.
+ *
+ * "complete"   — the full body fits within the routing window; `body` is the
+ *                complete bytes.  Exactly today's path: JSON.parse → peekModel →
+ *                resolve → decideRoute → dispatch.
+ *
+ * "over_window" — the body exceeded the window (or declared a Content-Length above
+ *                 it); `prefix` holds the bytes that were read before the trip.
+ *                 The rest is still on `req`.  The caller scans the prefix for the
+ *                 model key and either streams to Anthropic or answers 413.
+ *
+ * Invariant: peak buffered bytes per request ≤ window + one socket read.
+ */
+type IngestedBody =
+  | { readonly kind: "complete"; readonly body: Buffer }
+  | { readonly kind: "over_window"; readonly prefix: Buffer };
+
+/**
+ * Read request bytes up to `windowBytes` for the routing decision.
+ *
+ * Three paths:
+ *   1. Content-Length declared and > window → read up to min(MODEL_SNIFF_BYTES, window)
+ *      then settle as over_window.  No point buffering more: outcome is already decided.
+ *   2. Body fits within window → settle as complete.
+ *   3. Body crosses the window mid-stream → keep all accumulated bytes (they will be
+ *      forwarded), pause the stream, detach listeners in the same tick, settle as
+ *      over_window.  Buffered bytes are retained across pause and delivered by pipe().
+ *
+ * Replaced bufferBody which unconditionally produced body_too_large on over-window
+ * bodies.  That made the relay synthesize a 413 for every large Anthropic-bound body —
+ * an ADR-010 violation: the relay invented a status the origin never sent.
+ */
+const readBodyForRouting = (req: IncomingMessage, windowBytes: number): Promise<Result<IngestedBody, IngestError>> =>
   new Promise((resolve) => {
-    const tooLarge = (): Result<Buffer, BufferBodyError> =>
-      err({ kind: "body_too_large", message: `request body exceeds ${maxBytes} bytes` });
-
-    // A declared Content-Length over the cap settles the outcome before a byte
-    // arrives, so the body is never read: buffering up to maxBytes first would only
-    // pay memory for a 413 that is already decided.  The client sees exactly the same
-    // response either way — the origin also rejects on the declared length, so the
-    // relay's shape is unchanged (applies ADR-010).
+    // A declared Content-Length over the cap fixes the routing path before a byte
+    // arrives.  Rather than reading the full window (wasted memory), read only enough
+    // to sniff the model field (MODEL_SNIFF_BYTES) — an amount that is already
+    // sufficient to decide between Anthropic streaming and a 413.
     //
     // Number.isInteger rejects both a missing header (NaN) and a malformed one; a
-    // chunked or undeclared body has no length to check and is capped by the
-    // streaming counter below.
+    // chunked or undeclared body has no length to check and is handled below.
     const declared = Number(req.headers["content-length"]);
-    if (Number.isInteger(declared) && declared > maxBytes) {
-      resolve(tooLarge());
-      return;
-    }
+    const limit =
+      Number.isInteger(declared) && declared > windowBytes
+        ? Math.min(MODEL_SNIFF_BYTES, windowBytes)
+        : windowBytes;
 
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
-    const settle = (result: Result<Buffer, BufferBodyError>): void => {
+    const settle = (result: Result<IngestedBody, IngestError>): void => {
       if (settled) return;
       settled = true;
       resolve(result);
     };
     const onData = (chunk: Buffer): void => {
+      // Push the chunk FIRST — every byte must be kept for forwarding.
+      chunks.push(chunk);
       total += chunk.length;
-      if (total > maxBytes) {
-        // Detach before settling.  The caller answers 413 and hands the socket to
-        // drainRejectedUpload, which installs its own counting listener; leaving this
-        // one attached re-enters the rejected branch for every chunk still to arrive.
+      if (total > limit) {
+        // Detach all three listeners in the same tick before settling.  Leaving "data"
+        // attached continues to fire and would re-enter this branch for every subsequent
+        // chunk; leaving "end"/"error" attached leaves them active while drainRejectedUpload
+        // or pipe() owns the stream.  Pause first so in-flight data events already
+        // queued in the event loop run against the detached handlers (they are no-ops
+        // once removed, so the chunks are not re-processed).
+        req.pause();
         req.off("data", onData);
-        // Release the accumulated prefix now rather than holding up to maxBytes alive
-        // until the request object is collected — the drain keeps reading this socket.
-        chunks.length = 0;
-        settle(tooLarge());
+        req.off("end", onEnd);
+        req.off("error", onError);
+        settle(ok({ kind: "over_window", prefix: Buffer.concat(chunks) }));
         return;
       }
-      chunks.push(chunk);
     };
-    req.on("data", onData);
-    req.on("end", () => {
-      // Already rejected (body_too_large): drainRejectedUpload is draining the rest of
-      // the upload, so 'end' still fires here with nothing left to assemble.
+    const onEnd = (): void => {
       if (settled) return;
       const result = Buffer.concat(chunks);
       chunks.length = 0; // release chunk array while concatenated buffer is still in scope
-      settle(ok(result));
-    });
-    req.on("error", () => settle(err({ kind: "client_disconnected", message: "client aborted while sending body" })));
+      settle(ok({ kind: "complete", body: result }));
+    };
+    const onError = (): void =>
+      settle(err({ kind: "client_disconnected", message: "client aborted while sending body" }));
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
   });
 
 /**
@@ -448,29 +482,17 @@ export const createProxyServer = (deps: ServerDeps): Server => {
         return;
       }
 
-      // Only /v1/messages* bodies are buffered, and only to peek the model for
-      // routing; the raw bytes are forwarded untouched so Content-Length holds.
+      // Only /v1/messages* bodies are read for routing — to peek the model field.
+      // Bodies that fit within the routing window are buffered and forwarded byte-for-byte.
+      // Over-window bodies are streamed: only a prefix is read, then req is piped.
       if (req.method !== "POST" || !pathname.startsWith("/v1/messages")) {
         deps.forwardAnthropic(req, res);
         return;
       }
 
-      const body = await bufferBody(req, config.limits.maxBodyBytes);
-      if (!body.ok) {
-        switch (body.error.kind) {
-          case "body_too_large":
-            // `request_too_large` is the error type Anthropic's own API returns for a
-            // 413, so a client keyed on the origin's taxonomy recognises it (applies
-            // ADR-010).  The response carries no `connection: close`: that header is
-            // hop-by-hop, and the client's keep-alive agent owns the connection's
-            // lifecycle.  drainRejectedUpload then reads the rest of the upload under
-            // its own bounds so the socket closes with FIN — see its contract for why
-            // destroying it here would cost the client the 413 it was just sent.
-            res.writeHead(413, synthesizedHeaders());
-            res.end(toAnthropicErrorBody("request_too_large", body.error.message));
-            drainRejectedUpload(req);
-            return;
-
+      const ingest = await readBodyForRouting(req, config.limits.maxBufferedBodyBytes);
+      if (!ingest.ok) {
+        switch (ingest.error.kind) {
           case "client_disconnected":
             // The client is gone before the upload finished, so no response can reach
             // it and nothing is written to `res`.  `res` has already emitted "close" by
@@ -479,29 +501,38 @@ export const createProxyServer = (deps: ServerDeps): Server => {
             return;
 
           default: {
-            // Exhaustive check — a new BufferBodyError variant is a compile error here
+            // Exhaustive check — a new IngestError variant is a compile error here
             // rather than a request that returns nothing and is logged as a success.
-            const _exhaustive: never = body.error;
+            const _exhaustive: never = ingest.error;
             void _exhaustive;
             return;
           }
         }
       }
 
-      // Parse the body JSON once. The parsed value is passed to the provider handler
-      // so it never needs to call JSON.parse again (P4 contract).
+      // Parse the body JSON once (complete path only). The parsed value is passed to
+      // the provider handler so it never needs to call JSON.parse again (P4 contract).
       // On failure: parsedBody stays null, peekModel returns undefined, and the
       // request routes to Anthropic where the upstream will return its own error.
       let parsedBody: unknown = null;
-      try {
-        parsedBody = JSON.parse(body.value.toString("utf8"));
-      } catch {
-        // Invalid JSON: peekModel will return undefined → decideRoute routes to anthropic.
-      }
+      let forwardBody: ForwardedBody;
 
-      // `model` is the as-requested name — preserved for the request_complete log so
-      // operators can grep for what the client typed (a typo like "sol" not "sool").
-      model = peekModel(parsedBody);
+      if (ingest.value.kind === "complete") {
+        try {
+          parsedBody = JSON.parse(ingest.value.body.toString("utf8"));
+        } catch {
+          // Invalid JSON: peekModel will return undefined → decideRoute routes to anthropic.
+        }
+        // `model` is the as-requested name — preserved for the request_complete log so
+        // operators can grep for what the client typed (a typo like "sol" not "sool").
+        model = peekModel(parsedBody);
+        forwardBody = { kind: "complete", bytes: ingest.value.body };
+      } else {
+        // over_window: scan the prefix for the model key.
+        // JSON.parse is not available — the body is not fully buffered.
+        model = sniffLeadingModel(ingest.value.prefix);
+        forwardBody = { kind: "prefix", bytes: ingest.value.prefix };
+      }
 
       // Resolve the model name once before routing (ADR-005: resolution strictly before dispatch).
       // deps.resolve was built once at startup by buildDeps — structural guarantee.
@@ -509,21 +540,37 @@ export const createProxyServer = (deps: ServerDeps): Server => {
       const decision = decideRoute(req.method ?? "POST", path, resolution);
 
       switch (decision.kind) {
-        case "anthropic":
-          deps.forwardAnthropic(req, res, body.value);
+        case "anthropic": {
+          // Over-window Anthropic-bound bodies are forwarded as a stream: the relay
+          // buffers only a prefix, then pipes the rest.  This is the correct behavior
+          // per ADR-010: a relay-synthesized 413 for a body the origin would have
+          // accepted is a status the origin never emits.  Anthropic enforces its own
+          // payload limits with authoritative errors; we must not invent one first.
+          if (ingest.value.kind === "over_window") route = "anthropic:streamed";
+          deps.forwardAnthropic(req, res, forwardBody);
           return;
+        }
 
         case "provider": {
           // Fold canonical id into route log field: "codex:messages:gpt-5.6-sol"
           route = `${decision.provider}:${decision.endpoint}:${decision.model}`;
+          if (ingest.value.kind === "over_window") {
+            // The relay is the origin on the translated leg — it cannot translate a body
+            // it cannot hold.  413 is authoritative here, not relay-invented (ADR-010):
+            // the origin (subswitch) genuinely cannot process this request.
+            res.writeHead(413, synthesizedHeaders());
+            res.end(toAnthropicErrorBody("request_too_large", `request body exceeds ${config.limits.maxBufferedBodyBytes} bytes`));
+            drainRejectedUpload(req);
+            return;
+          }
           if (decision.endpoint === "count_tokens") {
-            deps.providers[decision.provider].handleCountTokens(req, res, body.value);
+            deps.providers[decision.provider].handleCountTokens(req, res, ingest.value.body);
             return;
           }
           await deps.providers[decision.provider].handleMessages(
             req,
             res,
-            body.value,
+            ingest.value.body,
             parsedBody,
             decision.model,
           );
@@ -550,7 +597,7 @@ export const createProxyServer = (deps: ServerDeps): Server => {
           // Distinct route label so request_complete is distinguishable from an intended
           // Anthropic route in post-hoc log analysis (applies ADR-010, avoids PF-023).
           route = "anthropic:ambiguous";
-          deps.forwardAnthropic(req, res, body.value);
+          deps.forwardAnthropic(req, res, forwardBody);
           return;
         }
 
@@ -566,7 +613,7 @@ export const createProxyServer = (deps: ServerDeps): Server => {
           // Distinct route label so request_complete is distinguishable from an intended
           // Anthropic route in post-hoc log analysis (applies ADR-010, avoids PF-023).
           route = "anthropic:fallback";
-          deps.forwardAnthropic(req, res, body.value);
+          deps.forwardAnthropic(req, res, forwardBody);
           return;
         }
 
@@ -574,7 +621,7 @@ export const createProxyServer = (deps: ServerDeps): Server => {
           // Exhaustive check — compiler enforces that all Route arms are handled.
           const _exhaustive: never = decision;
           void _exhaustive;
-          deps.forwardAnthropic(req, res, body.value);
+          deps.forwardAnthropic(req, res, forwardBody);
         }
       }
     };

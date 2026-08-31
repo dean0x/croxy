@@ -730,7 +730,7 @@ describe("codex leg", () => {
    * RELI-06: the non-streaming frame accumulation buffer must be bounded.
    *
    * All other buffers on the non-streaming path are bounded (SSE parser: maxSseEventBytes,
-   * request body: maxBodyBytes, translator: MAX_CONTENT_BLOCKS). The accumulation loop
+   * request body: maxBufferedBodyBytes, translator: MAX_CONTENT_BLOCKS). The accumulation loop
    * was the only remaining upstream-controlled, unbounded buffer.
    *
    * When the cap is exceeded the handler must return 502, not a 200 with empty or

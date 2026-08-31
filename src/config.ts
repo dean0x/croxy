@@ -220,7 +220,7 @@ const CodexProviderSchema = z
      *
      * Every other buffer on the non-streaming path is bounded: the SSE parser caps
      * individual events at `maxSseEventBytes`, the request body is capped at
-     * `maxBodyBytes`, and the translator now has `MAX_CONTENT_BLOCKS`. The
+     * `maxBufferedBodyBytes`, and the translator now has `MAX_CONTENT_BLOCKS`. The
      * non-streaming accumulation loop is the only remaining unbounded buffer, and its
      * size is upstream-controlled.
      *
@@ -286,8 +286,18 @@ const ProvidersSchema = z.object(PROVIDER_SCHEMAS).prefault({});
 
 const LimitsSchema = z
   .strictObject({
-    /** Maximum request body bytes buffered before the routing decision. */
-    maxBodyBytes: z.number().int().positive().default(32 * 1024 * 1024),
+    /**
+     * Maximum request body bytes the relay buffers before the routing decision.
+     *
+     * Three consequences:
+     *   1. Bodies at or below this size: fully buffered, JSON-parsed, routed by `model` field.
+     *   2. Bodies above this size bound for Anthropic: streamed verbatim — the prefix is
+     *      scanned for the `model` field, and the rest is piped to `api.anthropic.com`.
+     *   3. Bodies above this size bound for a translated route (Codex): answered
+     *      `413 request_too_large` — on that leg subswitch is the origin and cannot translate
+     *      a body it cannot hold.
+     */
+    maxBufferedBodyBytes: z.number().int().positive().default(32 * 1024 * 1024),
     /** Interval between SSE ping frames sent to clients during long Codex streams. */
     pingIntervalMs: z.number().int().positive().default(15_000),
   })
@@ -378,7 +388,7 @@ export interface Config {
   };
   readonly providers: ProviderConfigs;
   readonly limits: {
-    readonly maxBodyBytes: number;
+    readonly maxBufferedBodyBytes: number;
     readonly pingIntervalMs: number;
   };
 }
@@ -597,6 +607,10 @@ const LEGACY_KEY_ENTRIES: readonly LegacyKeyEntry[] = [
   // else is caught by strict parsing with Zod's unrecognized-key message.
   { kind: "removed", path: "anthropic.streamIdleTimeoutMs", reason: "the relay does not bound the stream-idle phase on a connected client, removed in 0.3.0 (ADR-010)" },
   { kind: "removed", path: "limits.maxConcurrentRequests", reason: "the admission gate was removed in 0.3.0 (ADR-010)" },
+  // Renamed in 0.4.0: the cap no longer applies to Anthropic-bound bodies (ADR-010) — it
+  // now controls only how much the relay buffers for routing, and over-window Anthropic
+  // traffic streams through rather than being rejected.
+  { kind: "moved", path: "limits.maxBodyBytes", to: "limits.maxBufferedBodyBytes" },
   // Kept last: the message this table renders is quoted verbatim in the 0.2.0 changelog,
   // and codex.models is its closing clause.
   { kind: "removed", path: "codex.models", reason: "the routable set now comes from the built-in model registry (use providers.codex.aliases for custom names), removed in 0.2.0 (ADR-006)" },
@@ -707,7 +721,7 @@ export const resolveConfig = (file: FileConfig): Config => ({
     codex: PROVIDER_RESOLVERS.codex(file.providers.codex),
   },
   limits: {
-    maxBodyBytes: file.limits.maxBodyBytes,
+    maxBufferedBodyBytes: file.limits.maxBufferedBodyBytes,
     pingIntervalMs: file.limits.pingIntervalMs,
   },
 });

@@ -106,30 +106,38 @@ describe("anthropic passthrough", () => {
     assert.equal(anthropic.requests[1]!.url, "/v1/models?limit=5");
   });
 
-  it("responds 413 with an anthropic-shaped error when the body exceeds the cap", async () => {
+  // Non-vacuity: RED against the old bufferBody path that returned body_too_large
+  // instead of over_window, which caused the relay to synthesize 413 for every
+  // large Anthropic-bound body instead of streaming it through.
+  it("streams an oversized Anthropic-bound body to the origin instead of synthesizing 413", async () => {
+    const sentBody = `{"model":"claude-sonnet-4-6","padding":"${"x".repeat(4096)}"}`;
     const { anthropic, subswitch } = await setup(
       (_req, res) => {
-        res.writeHead(200);
-        res.end();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "msg_ok" }));
       },
-      { maxBodyBytes: 1024 },
+      { maxBufferedBodyBytes: 1024 },
     );
 
     const response = await fetch(`${subswitch.url}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: `{"model":"claude-sonnet-4-6","padding":"${"x".repeat(4096)}"}`,
+      body: sentBody,
     });
-    assert.equal(response.status, 413);
+    // The body exceeds the 1024-byte routing window, but the model resolves to
+    // Anthropic — the relay must stream it through, not synthesize a 413.
+    assert.equal(response.status, 200, "Anthropic-bound over-window body must be forwarded, not rejected with 413");
     assert.equal(
       response.headers.get("x-subswitch-synthesized"),
-      "1",
-      "413 is relay-synthesized — must carry x-subswitch-synthesized: 1",
+      null,
+      "a forwarded response must NOT carry the synthesized marker",
     );
-    const body = (await response.json()) as { type: string; error: { type: string } };
-    assert.equal(body.type, "error");
-    assert.equal(body.error.type, "request_too_large");
-    assert.equal(anthropic.requests.length, 0);
+    assert.equal(anthropic.requests.length, 1, "the body must reach the upstream");
+    assert.equal(
+      anthropic.requests[0]!.body.toString("utf8"),
+      sentBody,
+      "the upstream must receive the full body byte-identical to what the client sent",
+    );
   });
 
   it("responds 502 anthropic-shaped when the upstream is unreachable", async () => {
@@ -781,27 +789,34 @@ describe("anthropic passthrough", () => {
   // rather than resolving with status 413.  With drainRejectedUpload the connection
   // closes cleanly (FIN) after all data is drained, and the 413 is always readable.
 
-  it("413 race: large upload receives the 413 response even while still sending body", async () => {
+  it("413 race: large upload to a translated route receives 413 even while still sending body", async () => {
     const { anthropic, subswitch } = await setup(
       (_req, res) => {
         res.writeHead(200);
         res.end();
       },
-      { maxBodyBytes: 1024 },
+      { maxBufferedBodyBytes: 1024 },
     );
 
-    // 8 MiB body — well above the 1024 byte cap.  Use rawHttpRequest so we
-    // control the send and can observe the raw status without fetch buffering
-    // complications.  The relay triggers body_too_large after 1024 bytes and
-    // sends 413 while the rest of the 8 MiB is still in-flight.
-    const largeBody = Buffer.alloc(8 * 1024 * 1024, "x");
+    // Body with a Codex model as the FIRST key, so the sniff identifies it as a
+    // translated route.  8 MiB total — well above the 1024-byte window.  Use
+    // rawHttpRequest so we control the send and observe the raw status without
+    // fetch buffering complications.  The relay triggers the translated-route 413
+    // after sniffing the prefix and sends it while the rest of the 8 MiB is
+    // still in-flight.  drainRejectedUpload prevents the 413 from being lost to RST.
+    const codexModel = "codex:gpt-5.6-sol";
+    const prefix = `{"model":"${codexModel}","messages":[`;
+    const largeBody = Buffer.concat([
+      Buffer.from(prefix),
+      Buffer.alloc(8 * 1024 * 1024 - prefix.length, "x"),
+    ]);
     const response = await rawHttpRequest(`${subswitch.url}/v1/messages`, {
       method: "POST",
       rawHeaders: ["Content-Type", "application/json"],
       body: largeBody,
     });
 
-    assert.equal(response.status, 413, "large-body 413 must be readable (drainRejectedUpload prevents RST before client reads response)");
+    assert.equal(response.status, 413, "large translated-route body must be answered 413 (drainRejectedUpload prevents RST before client reads response)");
     assert.equal(
       response.rawHeaders[response.rawHeaders.findIndex((h) => h.toLowerCase() === "x-subswitch-synthesized") + 1],
       "1",
@@ -809,7 +824,7 @@ describe("anthropic passthrough", () => {
     );
     const parsed = JSON.parse(response.body.toString("utf8")) as { type: string; error: { type: string } };
     assert.equal(parsed.error.type, "request_too_large", "413 body error type must be request_too_large");
-    assert.equal(anthropic.requests.length, 0, "upstream must not receive the oversized request");
+    assert.equal(anthropic.requests.length, 0, "Anthropic upstream must not receive the oversized request");
   });
 
   // ---------------------------------------------------------------------------
@@ -1158,7 +1173,7 @@ describe("anthropic passthrough — mid-stream client abort reclaims the upstrea
       agent,
     });
 
-    const relay = http.createServer((req, res) => forwarder(req, res, Buffer.from("{}")));
+    const relay = http.createServer((req, res) => forwarder(req, res, { kind: "complete", bytes: Buffer.from("{}") }));
     await new Promise<void>((r) => relay.listen(0, "127.0.0.1", r));
     const relayPort = (relay.address() as AddressInfo).port;
 
@@ -1239,7 +1254,7 @@ describe("anthropic passthrough — mid-stream client abort reclaims the upstrea
 
 describe("anthropic passthrough — drainRejectedUpload cuts off a client that ignores the 413 (B7)", () => {
   it("destroys the socket ~2 s after the 413 when the upload never stops", async () => {
-    const { subswitch } = await setup((_req, res) => res.end("{}"), { maxBodyBytes: 1024 });
+    const { subswitch } = await setup((_req, res) => res.end("{}"), { maxBufferedBodyBytes: 1024 });
     const { port } = new URL(subswitch.url);
 
     const timeline = await new Promise<{ responded: boolean; closedAfterMs: number }>((resolve, reject) => {
@@ -1247,12 +1262,16 @@ describe("anthropic passthrough — drainRejectedUpload cuts off a client that i
       let responded = false;
       let dribble: NodeJS.Timeout | undefined;
       const socket = net.connect(Number(port), "127.0.0.1", () => {
-        // Declare a body far larger than maxBodyBytes and never finish sending it.
+        // Declare a body far larger than maxBufferedBodyBytes and never finish sending it.
+        // The Codex model must be FIRST so the sniff identifies it as a translated route
+        // and the 413 fires (without it the body would stream to Anthropic, vacuously
+        // passing this test).  4 KiB first write is ≥ min(MODEL_SNIFF_BYTES, window)
+        // so the trip is immediate.
         socket.write(
           `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
             `content-type: application/json\r\ncontent-length: 1000000000\r\n\r\n`,
         );
-        socket.write(JSON.stringify({ model: "claude-sonnet-4-6", pad: "A".repeat(4096) }));
+        socket.write(JSON.stringify({ model: "codex:gpt-5.6-sol", pad: "A".repeat(4096) }));
         // Keep uploading after the 413 — the case the bound exists for.
         dribble = setInterval(() => socket.write("B".repeat(64)), 100);
       });
@@ -1345,21 +1364,28 @@ describe("server body ingestion — a client that vanishes mid-upload is not log
 });
 
 // ---------------------------------------------------------------------------
-// B9: a declared Content-Length over the cap is rejected before the body is read
+// B9: over-window body handling
 //
-// The declared length fixes the outcome before a byte arrives, so buffering up to
-// maxBodyBytes first would only cost memory: a 40 MiB upload paying a full 32 MiB of
-// buffering to reach a 413 that is already decided.  The client-visible outcome is the
-// same either way (413 + request_too_large + synthesized marker); only timing and peak
-// memory differ, and the origin rejects on the declared length too (ADR-010).
+// When a body exceeds the routing window:
+//   - Anthropic-bound: relay reads min(MODEL_SNIFF_BYTES, window) bytes to sniff the
+//     model field, then streams the rest to the upstream.  No 413 is produced: the
+//     relay must not synthesize a status the origin would never emit (ADR-010).
+//   - Translated-route (Codex): relay answers 413 — it is the origin on that leg and
+//     cannot translate a body it cannot hold.
 //
-// Non-vacuity: RED against code that ignores Content-Length — the client sends one
-// small chunk and stops, the relay waits for a cap it will never reach, and the
-// 3 s budget below rejects with the count of bytes actually sent.  The second case
-// pins the streaming cap for chunked bodies, which have no declared length at all.
+// Case 1: a declared Content-Length above the window on a Codex body triggers 413
+// after the sniff rather than requiring the relay to buffer the full body first.
+//
+// Non-vacuity (case 1): RED against code that reads the full window before checking
+// — the client sends only MODEL_SNIFF_BYTES worth of data and stops; the relay must
+// not wait for more.
+//
+// Case 2: a chunked Anthropic body (no declared length) that crosses the window is
+// forwarded to the origin — the relay switches to streaming mid-body, and the origin
+// receives the full bytes.
 // ---------------------------------------------------------------------------
 
-describe("server body ingestion — declared Content-Length over the cap is answered before the body is read (B9)", () => {
+describe("server body ingestion — over-window body handling (B9)", () => {
   const readReply = (port: string, write: (socket: net.Socket) => void, budgetMs: number): Promise<string> =>
     new Promise<string>((resolve, reject) => {
       let reply = "";
@@ -1372,22 +1398,30 @@ describe("server body ingestion — declared Content-Length over the cap is answ
           settle = setTimeout(() => { socket.destroy(); resolve(reply); }, 50);
         }
       });
-      socket.on("error", () => { /* the relay destroys the socket after the drain bound */ });
+      socket.on("error", () => { /* the relay destroys the socket after drain / on abort */ });
       const giveUp = setTimeout(() => {
         socket.destroy();
-        reject(new Error(`no reply within ${budgetMs} ms — the relay is still reading a body whose outcome is already decided`));
+        reject(new Error(`no reply within ${budgetMs} ms — relay may be waiting when outcome is already decided`));
       }, budgetMs);
       giveUp.unref();
     });
 
-  it("answers 413 after one small chunk instead of buffering maxBodyBytes first", async () => {
+  it("a declared-oversize Codex body reaches the origin before the client finishes uploading", async () => {
+    // Non-vacuity: RED against the old path that buffered the full window before the
+    // translated-route 413 fired — with window 1 MiB and only MODEL_SNIFF_BYTES sent,
+    // the old code never tripped and the 3 s budget expired.
     const MAX_BODY = 1024 * 1024;
-    const FIRST_CHUNK = 4096;
+    // First write must be ≥ min(MODEL_SNIFF_BYTES, window) so the over-window trip
+    // fires immediately on the declared-length short-circuit path.
+    const FIRST_CHUNK = 8 * 1024; // = MODEL_SNIFF_BYTES
     const { anthropic, subswitch } = await setup(
       (_req, res) => { res.writeHead(200); res.end("{}"); },
-      { maxBodyBytes: MAX_BODY },
+      { maxBufferedBodyBytes: MAX_BODY },
     );
     const { port } = new URL(subswitch.url);
+
+    const codexModel = "codex:gpt-5.6-sol";
+    const bodyPrefix = `{"model":"${codexModel}","pad":"${"A".repeat(FIRST_CHUNK)}"}`;
 
     const reply = await readReply(
       port,
@@ -1396,24 +1430,26 @@ describe("server body ingestion — declared Content-Length over the cap is answ
           `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
             `content-type: application/json\r\ncontent-length: ${MAX_BODY * 4}\r\n\r\n`,
         );
-        // The only body bytes this client will ever send — a fraction of the cap.
-        socket.write("x".repeat(FIRST_CHUNK));
+        // Codex model as first key so the sniff identifies it as a translated route.
+        socket.write(bodyPrefix);
       },
       3_000,
     );
 
-    assert.match(reply, /^HTTP\/1\.1 413 /, `declared oversize must be answered 413; got: ${JSON.stringify(reply.split("\r\n")[0])}`);
+    assert.match(reply, /^HTTP\/1\.1 413 /, `declared-oversize Codex body must be answered 413; got: ${JSON.stringify(reply.split("\r\n")[0])}`);
     assert.match(reply, /x-subswitch-synthesized: 1/i, "the 413 must carry the synthesized marker");
     assert.match(reply, /"request_too_large"/, `the 413 body must carry error type request_too_large; got: ${JSON.stringify(reply)}`);
     assert.ok(FIRST_CHUNK < MAX_BODY, "the client must stop well short of the cap for this to prove anything");
-    assert.equal(anthropic.requests.length, 0, "an oversized request must not reach the upstream");
+    assert.equal(anthropic.requests.length, 0, "Anthropic upstream must not receive the oversized translated request");
   });
 
-  it("still caps a chunked body, which declares no length at all", async () => {
+  it("a chunked oversized body bound for Anthropic streams through to the origin", async () => {
+    // Non-vacuity: RED against the old bufferBody path that returned body_too_large
+    // on the streaming accumulation trip — the relay answered 413 instead of forwarding.
     const MAX_BODY = 1024;
     const { anthropic, subswitch } = await setup(
-      (_req, res) => { res.writeHead(200); res.end("{}"); },
-      { maxBodyBytes: MAX_BODY },
+      (_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); },
+      { maxBufferedBodyBytes: MAX_BODY },
     );
     const { port } = new URL(subswitch.url);
 
@@ -1425,15 +1461,18 @@ describe("server body ingestion — declared Content-Length over the cap is answ
             `content-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n`,
         );
         const piece = "x".repeat(512);
-        // Four 512-byte chunks cross the 1 KiB cap with no Content-Length in sight.
-        for (let i = 0; i < 4; i += 1) socket.write(`200\r\n${piece}\r\n`);
+        // Four 512-byte chunks cross the 1 KiB window with no Content-Length.
+        // Model is Anthropic (no "codex:" prefix) so streaming path applies.
+        socket.write(`${(8).toString(16)}\r\n{"model"\r\n`);
+        for (let i = 0; i < 4; i += 1) socket.write(`${(512).toString(16)}\r\n${piece}\r\n`);
+        socket.write("0\r\n\r\n");
       },
       3_000,
     );
 
-    assert.match(reply, /^HTTP\/1\.1 413 /, `a chunked body over the cap must be answered 413; got: ${JSON.stringify(reply.split("\r\n")[0])}`);
-    assert.match(reply, /"request_too_large"/, `the 413 body must carry error type request_too_large; got: ${JSON.stringify(reply)}`);
-    assert.equal(anthropic.requests.length, 0, "an oversized request must not reach the upstream");
+    assert.match(reply, /^HTTP\/1\.1 200 /, `a chunked oversized Anthropic body must be forwarded and return 200; got: ${JSON.stringify(reply.split("\r\n")[0])}`);
+    assert.ok(!reply.includes("x-subswitch-synthesized: 1"), "a forwarded response must NOT carry the synthesized marker");
+    assert.equal(anthropic.requests.length, 1, "the over-window body must reach the upstream");
   });
 });
 
@@ -1466,7 +1505,7 @@ describe("server body ingestion — the rejected-upload drain is bounded by byte
     // buffer ahead of it) and well below the declared length, so only the presence
     // of a byte bound decides the outcome.
     const CEILING = 200 * 1024 * 1024;
-    const { subswitch } = await setup((_req, res) => res.end("{}"), { maxBodyBytes: 1024 });
+    const { subswitch } = await setup((_req, res) => res.end("{}"), { maxBufferedBodyBytes: 1024 });
     const { port } = new URL(subswitch.url);
 
     const outcome = await new Promise<{ responded: boolean; written: number }>((resolve, reject) => {
@@ -1477,6 +1516,10 @@ describe("server body ingestion — the rejected-upload drain is bounded by byte
           `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
             `content-type: application/json\r\ncontent-length: ${DECLARED}\r\n\r\n`,
         );
+        // Codex model as first key so the sniff identifies it as a translated route
+        // and the 413 fires.  Without this the relay would stream to Anthropic and
+        // never invoke drainRejectedUpload — making this test vacuous (applies PF-011).
+        socket.write(JSON.stringify({ model: "codex:gpt-5.6-sol", pad: "A".repeat(4096) }));
         // Stream as fast as the socket accepts and never stop — the case the byte
         // bound exists for.  write() returns false on the first 1 MiB chunk, so the
         // loop is one chunk per "drain", not a spin.
@@ -1866,6 +1909,206 @@ describe("anthropic passthrough — an unbuffered 502 reclaims a client that is 
       outcome.closedAfterMs > 1_500 && outcome.closedAfterMs < 4_000,
       `the drain's time bound must reclaim the connection; closed after ${outcome.closedAfterMs} ms ` +
         `(expected > 1_500 && < 4_000; -1 means still open at the ${GIVE_UP_MS} ms give-up, i.e. held until requestTimeout)`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B15: over-window streaming edge cases
+//
+// Four invariants beyond what B9 pins:
+//   1. Model key beyond the sniff prefix → fail open to Anthropic (no 413 invented).
+//   2. Body exactly at the window boundary → full JSON.parse, not sniff path.
+//   3. Client abort on the prefix streaming path → settle claimed by client disconnect,
+//      NOT by upstream error (no anthropic_upstream_error warn).
+//   4. Byte identity across the prefix seam — the full body (prefix + remainder)
+//      reaches the upstream byte-for-byte.
+// ---------------------------------------------------------------------------
+
+describe("server body ingestion — over-window streaming edge cases (B15)", () => {
+  // Shared readReply helper: connect to port, write via callback, read until headers arrive,
+  // then settle 100 ms later for body fragments to drain.
+  const readReply = (port: string, write: (socket: net.Socket) => void, budgetMs: number): Promise<string> =>
+    new Promise<string>((resolve, reject) => {
+      let reply = "";
+      let settle: NodeJS.Timeout | undefined;
+      const socket = net.connect(Number(port), "127.0.0.1", () => write(socket));
+      socket.on("data", (chunk: Buffer) => {
+        reply += chunk.toString("utf8");
+        if (reply.includes("\r\n\r\n") && settle === undefined) {
+          settle = setTimeout(() => { socket.destroy(); resolve(reply); }, 100);
+        }
+      });
+      socket.on("error", () => { /* relay closes socket after drain / on abort */ });
+      const giveUp = setTimeout(() => {
+        socket.destroy();
+        reject(new Error(`no reply within ${budgetMs} ms`));
+      }, budgetMs);
+      giveUp.unref();
+    });
+
+  it("sniff fails open to Anthropic when the model key lies beyond the sniff prefix", async () => {
+    // Non-vacuity: RED against code that synthesizes a 413 when the model cannot be
+    // identified in the prefix (wrong — relay must not invent 413 for Anthropic-bound
+    // traffic; ADR-010).  RED against fail-open to an error response rather than Anthropic.
+    //
+    // Setup: window = 1024, chunked transfer (no CL → limit = window = 1024).
+    // First HTTP chunk = 1025 decoded bytes, no "model" key → trips over_window.
+    // sniff scans prefix[0..MODEL_SNIFF_BYTES] = prefix[0..1024] (the 1025-byte chunk) →
+    // no "model" key → undefined → fail open to Anthropic streaming path → 200.
+    const { anthropic, subswitch } = await setup(
+      (_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); },
+      { maxBufferedBodyBytes: 1024 },
+    );
+    const { port } = new URL(subswitch.url);
+
+    // First HTTP chunk: 1025 bytes, all padding — "model" key is absent.
+    // Second HTTP chunk: closes the JSON object with the model key.
+    const firstChunk = '{"pad":"' + "A".repeat(1017); // 8 + 1017 = 1025 bytes; no closing quote
+    const secondChunk = '","model":"claude-sonnet-4-6"}'; // 30 bytes; closes JSON
+
+    const reply = await readReply(
+      port,
+      (socket) => {
+        socket.write(
+          `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+            `content-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n`,
+        );
+        socket.write(`${firstChunk.length.toString(16)}\r\n${firstChunk}\r\n`);
+        socket.write(`${secondChunk.length.toString(16)}\r\n${secondChunk}\r\n`);
+        socket.write("0\r\n\r\n");
+      },
+      3_000,
+    );
+
+    assert.match(
+      reply,
+      /^HTTP\/1\.1 200 /,
+      `model key beyond the sniff prefix must fail open to Anthropic → 200; got: ${JSON.stringify(reply.split("\r\n")[0])}`,
+    );
+    assert.ok(
+      !reply.includes("x-subswitch-synthesized: 1"),
+      "a forwarded response must NOT carry the synthesized marker",
+    );
+    assert.equal(
+      anthropic.requests.length,
+      1,
+      "the body must reach the Anthropic upstream on the fail-open path",
+    );
+  });
+
+  it("a body exactly at the window boundary takes the complete path, not the sniff path", async () => {
+    // Non-vacuity: documents the exclusive boundary (`>` not `>=`) — a body of exactly
+    // `windowBytes` must NOT trip the over_window branch.  The body is processed by full
+    // JSON.parse, the model is found, and the request reaches the upstream byte-identical.
+    //
+    // The route label would be "anthropic" (complete path) rather than "anthropic:streamed"
+    // (sniff path), but we verify the observable invariant: byte-identical delivery to upstream.
+    const WINDOW = 1024;
+    // Pad body to exactly WINDOW bytes so total === limit (not > limit) → complete path.
+    const bodyPrefix = '{"model":"claude-sonnet-4-6","pad":"';
+    const bodySuffix = '"}';
+    const pad = "A".repeat(WINDOW - bodyPrefix.length - bodySuffix.length);
+    const sentBody = `${bodyPrefix}${pad}${bodySuffix}`;
+    assert.equal(sentBody.length, WINDOW, "pre-condition: sentBody must be exactly WINDOW bytes");
+
+    const { anthropic, subswitch } = await setup(
+      (_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); },
+      { maxBufferedBodyBytes: WINDOW },
+    );
+
+    const response = await fetch(`${subswitch.url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: sentBody,
+    });
+
+    assert.equal(response.status, 200, "body exactly at window must route correctly → 200");
+    assert.equal(anthropic.requests.length, 1, "Anthropic must receive exactly one request");
+    assert.equal(
+      anthropic.requests[0]!.body.toString("utf8"),
+      sentBody,
+      "upstream body must be byte-identical to the sent body (complete path, not piped from prefix)",
+    );
+  });
+
+  it("client abort on the prefix streaming path claims settle without logging an upstream error", async () => {
+    // Non-vacuity: RED against code that does not claim settle() in res.on("close") before
+    // calling upstream.destroy() — the upstream error handler would then fire and emit
+    // "anthropic_upstream_error", misattributing a client fault as an upstream failure.
+    //
+    // Flow: over_window trip → sniff finds claude model → Anthropic streaming path →
+    // req.pipe(upstream) → client disconnects → res.on("close") claims settle() →
+    // upstream.destroy() → upstream.on("error") fires → settle() already spent → no warn.
+    const captured: Array<{ level: LogLevel; event: string }> = [];
+    const fakeUpstream = await startFakeUpstream(() => {
+      // Never respond — the body never completes (client disconnects first).
+    });
+    const subswitch = await startSubswitch(
+      { anthropic: { baseUrl: fakeUpstream.url }, limits: { maxBufferedBodyBytes: 1024 } },
+      { logger: { log(level, event) { captured.push({ level, event }); } } },
+    );
+    cleanups.push(subswitch.close, fakeUpstream.close);
+
+    const { port } = new URL(subswitch.url);
+
+    // First chunk trips over_window with model in prefix → Anthropic streaming path.
+    // Content-Length declared > window → limit = min(MODEL_SNIFF_BYTES, 1024) = 1024.
+    const firstChunk = '{"model":"claude-sonnet-4-6","pad":"' + "A".repeat(1024);
+    await new Promise<void>((resolve) => {
+      const socket = net.connect(Number(port), "127.0.0.1", () => {
+        socket.write(
+          `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+            `content-type: application/json\r\ncontent-length: 65536\r\n\r\n`,
+        );
+        socket.write(firstChunk);
+        // Abort mid-upload — relay is still waiting for the remaining body.
+        setTimeout(() => { socket.destroy(); resolve(); }, 50);
+      });
+      socket.on("error", () => { /* RST/EPIPE expected after destroy */ });
+    });
+
+    // Allow the relay's event loop to process the disconnect and settle.
+    await new Promise<void>((r) => setTimeout(r, 150));
+
+    const upstreamErrors = captured.filter((e) => e.event === "anthropic_upstream_error");
+    assert.equal(
+      upstreamErrors.length,
+      0,
+      `client disconnect on the prefix path must NOT emit anthropic_upstream_error; got: ${JSON.stringify(upstreamErrors)}`,
+    );
+  });
+
+  it("over-window body arrives byte-identical at the upstream across the prefix seam", async () => {
+    // Non-vacuity: RED against a bug where prefix bytes are written twice (once via
+    // upstream.write(consumed.bytes) and once leaked through pipe), or where the seam
+    // drops bytes — the upstream body would diverge from sentBody and the strict-equal
+    // assertion would fail.
+    //
+    // Uses fetch (Content-Length = body.length, declared > window) so the relay reads
+    // up to min(MODEL_SNIFF_BYTES, window) = 1024 bytes before the over_window trip,
+    // writes the prefix to upstream, then pipes the remainder via req.pipe(upstream).
+    const WINDOW = 1024;
+    const sentBody = `{"model":"claude-sonnet-4-6","pad":"${"x".repeat(4000)}"}`;
+    // body.length ≈ 4038 >> WINDOW. "model" is the first key → Anthropic streaming path.
+
+    const { anthropic, subswitch } = await setup(
+      (_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); },
+      { maxBufferedBodyBytes: WINDOW },
+    );
+
+    const response = await fetch(`${subswitch.url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: sentBody,
+    });
+
+    assert.equal(response.status, 200, "over-window Anthropic body must reach the upstream → 200");
+    assert.equal(anthropic.requests.length, 1, "upstream must receive exactly one request");
+    assert.equal(
+      anthropic.requests[0]!.body.toString("utf8"),
+      sentBody,
+      "body at the upstream must be byte-identical to what the client sent across the prefix seam",
     );
   });
 });

@@ -39,7 +39,7 @@ describe("loadConfig", () => {
     assert.equal(result.value.config.providers.codex.streamIdleTimeoutMs, 300_000);
     assert.equal(result.value.config.providers.codex.maxSseEventBytes, 4 * 1024 * 1024);
     assert.equal(result.value.config.providers.codex.maxAggregateBytes, 64 * 1024 * 1024);
-    assert.equal(result.value.config.limits.maxBodyBytes, 32 * 1024 * 1024);
+    assert.equal(result.value.config.limits.maxBufferedBodyBytes, 32 * 1024 * 1024);
     assert.equal(result.value.config.limits.pingIntervalMs, 15_000);
     assert.equal(result.value.fileFound, false);
   });
@@ -241,6 +241,31 @@ describe("loadConfig", () => {
   // -------------------------------------------------------------------------
   // Removed keys (hard-error via LEGACY_KEY_ENTRIES — BREAKING in 0.3.0)
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // Moved key (hard-error via LEGACY_KEY_ENTRIES — BREAKING in 0.4.0)
+  // -------------------------------------------------------------------------
+
+  it("BREAKING 0.4.0: limits.maxBodyBytes is rejected with move-phrasing naming limits.maxBufferedBodyBytes", () => {
+    // The key was renamed: the relay now buffers only for routing, and over-window
+    // Anthropic traffic streams through rather than being rejected (ADR-010).
+    // MUTATION PROOF: removing the limits.maxBodyBytes entry from LEGACY_KEY_ENTRIES
+    // would cause this test to fail — the config would parse with Zod's unrecognized-key
+    // error rather than the move-phrasing that names the replacement.
+    // MUTATION PROOF: changing the entry to kind: "removed" would cause the delete-phrasing
+    // assertion to fire and the no-delete assertion to pass vacuously.
+    const result = loadConfig({
+      configPath: "x",
+      readFile: () => JSON.stringify({ limits: { maxBodyBytes: 16 * 1024 * 1024 } }),
+    });
+    assert.ok(!result.ok, "renamed key must be rejected as a hard error");
+    assert.equal(result.error.kind, "translate");
+    const msg = result.error.message;
+    // Must use move-phrasing naming the replacement key.
+    assert.match(msg, /move `limits\.maxBodyBytes`/, "error must use move-phrasing for the renamed key");
+    assert.match(msg, /`limits\.maxBufferedBodyBytes`/, "error must name the replacement key");
+    assert.ok(!msg.includes("delete `limits.maxBodyBytes`"), "must not use delete-phrasing for a renamed key");
+  });
 
   it("BREAKING 0.3.0: limits.maxConcurrentRequests is now rejected with a legible error naming the key", () => {
     // The admission gate was removed (ADR-010), so a v0.2.0 config carrying the key

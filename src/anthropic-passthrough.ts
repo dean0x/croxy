@@ -94,7 +94,25 @@ export interface PassthroughOptions {
   readonly agent?: http.Agent;
 }
 
-export type AnthropicForwarder = (req: IncomingMessage, res: ServerResponse, body?: Buffer) => void;
+/**
+ * Describes how much of the request body the caller has already read.
+ *
+ * "complete" — the full body is in `bytes`; nothing remains on `req`. The forwarder
+ *   calls `upstream.end(bytes)` and never pipes `req`. This is the common path for
+ *   bodies that fit within the routing window.
+ *
+ * "prefix" — `bytes` holds bytes that were already read (possibly empty); the rest
+ *   is still flowing on `req`. The forwarder writes the prefix then pipes `req`.
+ *   This is the over-window path: we read enough to sniff the model, then stream.
+ *
+ * Invariant: `pipe()` on a readable that has already emitted `end` never ends the
+ * destination — the discriminant makes that hang unrepresentable.
+ */
+export type ForwardedBody =
+  | { readonly kind: "complete"; readonly bytes: Buffer }
+  | { readonly kind: "prefix"; readonly bytes: Buffer };
+
+export type AnthropicForwarder = (req: IncomingMessage, res: ServerResponse, body?: ForwardedBody) => void;
 
 export const createAnthropicForwarder = (options: PassthroughOptions): AnthropicForwarder => {
   const target = new URL(options.baseUrl);
@@ -106,8 +124,16 @@ export const createAnthropicForwarder = (options: PassthroughOptions): Anthropic
   const agentOpts: http.AgentOptions = { keepAlive: true, maxSockets: options.maxUpstreamSockets, scheduling: "lifo" };
   const agent = options.agent ?? (target.protocol === "https:" ? new https.Agent(agentOpts) : new http.Agent(agentOpts));
 
+  // Sentinel for "no bytes consumed yet" — the prefix path with an empty prefix.
+  // Shared across calls so allocation is constant rather than per-request.
+  const EMPTY_PREFIX: ForwardedBody = { kind: "prefix", bytes: Buffer.alloc(0) };
+
   return (req, res, body) => {
     const path = `${basePath}${req.url ?? "/"}`;
+    // Normalise: omitted means nothing has been read yet (prefix path, empty prefix).
+    const consumed = body ?? EMPTY_PREFIX;
+    // True when req still has bytes to deliver (prefix path).
+    const streaming = consumed.kind === "prefix";
     // One-way latch over a four-outcome terminal state machine:
     //   1. upstream response headers  — relayed verbatim
     //   2. connect-phase timeout      — synthesized 504
@@ -236,7 +262,7 @@ export const createAnthropicForwarder = (options: PassthroughOptions): Anthropic
       } else {
         res.destroy();
       }
-      if (body === undefined) {
+      if (streaming) {
         req.unpipe(upstream);
         drainRejectedUpload(req);
       }
@@ -260,7 +286,7 @@ export const createAnthropicForwarder = (options: PassthroughOptions): Anthropic
       } else {
         res.destroy();
       }
-      if (body === undefined) {
+      if (streaming) {
         req.unpipe(upstream);
         drainRejectedUpload(req);
       }
@@ -285,9 +311,16 @@ export const createAnthropicForwarder = (options: PassthroughOptions): Anthropic
       upstream.destroy();
     });
 
-    if (body !== undefined) {
-      upstream.end(body);
+    if (consumed.kind === "complete") {
+      // Full body already buffered — end the upstream in one write.  No pipe, no
+      // client-stream error handler needed: req has delivered everything it will.
+      upstream.end(consumed.bytes);
     } else {
+      // Prefix path: write the bytes we already read, then pipe the remainder.
+      // Invariant (stated in ForwardedBody): pipe() on a readable that has already
+      // emitted "end" never ends the destination — the discriminant makes that hang
+      // unrepresentable.
+      if (consumed.bytes.length > 0) upstream.write(consumed.bytes);
       req.pipe(upstream);
       // A failed client stream takes the upstream down with it, and claims the
       // settlement on the way out for the same reason the res "close" handler does:
