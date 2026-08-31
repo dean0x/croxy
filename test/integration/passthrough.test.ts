@@ -2098,12 +2098,14 @@ describe("server body ingestion — over-window streaming edge cases (B15)", () 
       0,
       `client disconnect on the prefix path must NOT emit anthropic_upstream_error; got: ${JSON.stringify(upstreamErrors)}`,
     );
-    // Positive assertion: the relay actually started forwarding to the upstream before the
-    // client disconnected — the abort is real work stopped mid-flight, not a silent drop.
+    // Positive assertion: the relay actually established a connection to the upstream before
+    // the client disconnected — the abort is real work stopped mid-flight, not a silent drop.
+    // connectionCount (not requests.length) is checked because requests are only recorded
+    // on req "end", which never fires when the relay aborts the upstream mid-stream.
     assert.equal(
-      fakeUpstream.requests.length,
+      fakeUpstream.connectionCount,
       1,
-      "relay must have initiated one upstream request before the client aborted",
+      "relay must have established one upstream connection before the client aborted",
     );
   });
 
@@ -2193,14 +2195,24 @@ describe("server body ingestion — over-window streaming edge cases (B15)", () 
 // ---------------------------------------------------------------------------
 
 describe("server body ingestion — dispatch rejection drains paused over-window body (B16)", () => {
-  it("dispatch() rejection drains a paused over-window body so the socket does not wedge", async () => {
-    // Inject a forwardAnthropic that throws synchronously.  When dispatch() receives an
-    // over_window ingest result it calls forwardAnthropic; the injected throw rejects the
-    // dispatch() promise, reaching the .catch handler.  Without drainRejectedUpload in
-    // the .catch handler, req stays paused and the client's upload hangs indefinitely.
+  it("dispatch() rejection sends 500 and drains the paused over-window req", async () => {
+    // Non-vacuity: RED against a dispatch().catch that omits drainRejectedUpload(req).
+    // Without the drain, req stays paused after the 500 is sent — the server holds the
+    // socket open and the client fetch() hangs waiting for the body to arrive.  With the
+    // drain, req is resumed so the client can receive the complete 500 response and the
+    // fetch() resolves promptly.
+    //
+    // Injects a forwardAnthropic that throws synchronously.  The over_window trip pauses
+    // req; forwardAnthropic throws; dispatch().catch sends 500 + drainRejectedUpload(req).
+    // Set maxBufferedBodyBytes = 512 so the 639-byte body trips over_window → req.pause().
+    const WINDOW = 512;
     const config = loadConfig({
       configPath: "inline-test-config.json",
-      readFile: () => JSON.stringify({ logLevel: "error", anthropic: { baseUrl: "http://127.0.0.1:1" } }),
+      readFile: () => JSON.stringify({
+        logLevel: "error",
+        anthropic: { baseUrl: "http://127.0.0.1:1" },
+        limits: { maxBufferedBodyBytes: WINDOW },
+      }),
     });
     if (!config.ok) throw new Error(`config load failed: ${config.error.message}`);
     const depsResult = buildDeps(config.value.config);
@@ -2213,50 +2225,23 @@ describe("server body ingestion — dispatch rejection drains paused over-window
     const { port } = (server.address() as AddressInfo);
     cleanups.push(() => new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); }));
 
-    // Send a declared-over-window body in two writes.  The first write trips over_window
-    // → req.pause() → forwardAnthropic throws → dispatch().catch fires.  drainRejectedUpload
-    // must resume req so the second write can drain and the socket closes.
-    const WINDOW = 512;
-    const firstPayload = '{"model":"claude-sonnet-4-6","pad":"' + "A".repeat(WINDOW + 50);
-    const secondPayload = "B".repeat(100) + '"}';
-    const totalLength = firstPayload.length + secondPayload.length;
+    // Send a body larger than the routing window.  The relay trips over_window (req.pause()),
+    // then forwardAnthropic throws, dispatch().catch fires and sends 500 + drains req.
+    const sentBody = '{"model":"claude-sonnet-4-6","data":"' + "A".repeat(600) + '"}';
+    // sentBody.length ≈ 639 > WINDOW=512 → over_window trip → req.pause().
 
-    const timeline = await new Promise<{ reply: string; secondWriteMs: number }>((resolve, reject) => {
-      const socket = net.connect(Number(port), "127.0.0.1", () => {
-        socket.write(
-          `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
-            `content-type: application/json\r\ncontent-length: ${totalLength}\r\n\r\n`,
-        );
-        socket.write(firstPayload);
-
-        // Second write after 40 ms — must drain promptly once drainRejectedUpload resumes req.
-        const writeStart = Date.now();
-        setTimeout(() => {
-          socket.write(secondPayload, () => {
-            resolve({ reply: collected, secondWriteMs: Date.now() - writeStart });
-          });
-        }, 40);
-      });
-
-      let collected = "";
-      socket.on("data", (chunk: Buffer) => { collected += chunk.toString("utf8"); });
-      socket.on("error", () => { /* EPIPE/RST after relay closes; reply already collected */ });
-
-      const giveUp = setTimeout(() => {
-        socket.destroy();
-        reject(new Error("socket did not drain within 3 s — req may still be wedged (missing drainRejectedUpload in dispatch().catch)"));
-      }, 3_000);
-      giveUp.unref();
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: sentBody,
     });
 
-    assert.ok(
-      timeline.reply.includes("HTTP/1.1 500"),
-      `dispatch() rejection must produce a 500 response; got: ${JSON.stringify(timeline.reply.slice(0, 200))}`,
+    assert.equal(
+      response.status,
+      500,
+      "dispatch() rejection must produce a 500 response; drainRejectedUpload must resume req so the response is deliverable",
     );
-    assert.ok(
-      timeline.secondWriteMs < 2_000,
-      `second write must complete within 2 s (drain unblocks it); took ${timeline.secondWriteMs} ms — ` +
-        `a timeout here means req is still paused (missing drainRejectedUpload in dispatch().catch)`,
-    );
+    const body = await response.text();
+    assert.ok(body.includes("api_error"), `500 body must include api_error type; got: ${JSON.stringify(body.slice(0, 200))}`);
   });
 });
