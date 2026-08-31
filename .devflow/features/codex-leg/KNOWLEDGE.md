@@ -1,7 +1,7 @@
 ---
 feature: codex-leg
 name: Codex translation leg (gpt-* → /responses)
-description: "Use when modifying Codex request translation, model alias resolution, session/cache key derivation, protocol headers, reasoning round-trips, count_tokens estimation, ambiguous-model routing policy, timeout asymmetry, or the codex-recorder dev tool. Keywords: codex, gpt, responses, conversation key, session_id, prompt_cache_key, reasoning, effort, translation, routing table, alias, family, canonical, buildRoutingTable, resolveModel, ModelResolution, buildHeaders, CodexTransportConstants, maxAggregateBytes, forceRefresh, count_tokens, estimateTokens, ambiguous_model_name, BufferBodyError, ADR-010, streamIdleTimeoutMs."
+description: "Use when modifying Codex request translation, model alias resolution, session/cache key derivation, protocol headers, reasoning round-trips, count_tokens estimation, ambiguous-model routing policy, timeout asymmetry, or the codex-recorder dev tool. Keywords: codex, gpt, responses, conversation key, session_id, prompt_cache_key, reasoning, effort, translation, routing table, alias, family, canonical, buildRoutingTable, resolveModel, ModelResolution, buildHeaders, CodexTransportConstants, maxAggregateBytes, forceRefresh, count_tokens, estimateTokens, ambiguous_model_name, IngestError, ADR-010, streamIdleTimeoutMs."
 category: domain-knowledge
 directories: [src]
 created: 2026-07-22
@@ -182,9 +182,11 @@ The seven auth events now in `ProviderEvents<P>`: `tokenRefreshed`, `refreshToke
 
 ```
 IncomingMessage (Anthropic wire)
-  → bufferBody (raw bytes preserved; body_too_large → 413; client_disconnected → drop)
-  → JSON.parse (once; parsedBody passed to handler — P4 contract)
-  → peekModel (as-requested name for logs; never reassigned)
+  → readBodyForRouting (raw bytes preserved; over_window → prefix+pipe or 413; client_disconnected → drop)
+      ├── complete (body ≤ window) → JSON.parse → peekModel → decideRoute
+      └── over_window (body > window)
+          ├── Anthropic-bound → sniffLeadingModel(prefix) → stream to upstream (no 413; ADR-010)
+          └── provider-bound → 413 request_too_large + drainRejectedUpload
   → deps.resolve(model) → ModelResolution (table built once at startup in buildDeps)
   → decideRoute(method, path, resolution) → Route
       ├── "ambiguous" → warn ambiguous_model_name; forward to Anthropic (fail open, ADR-010)
@@ -242,8 +244,8 @@ IncomingMessage (Anthropic wire)
 | Unrepresentable upstream status | 502 with `api_error` — **kept deliberately** (ADR-010: same rationale; the upstream produced a status, and 502 is the truthful relay response). |
 | Abort (client close or timeout) | `AbortController` shared between `res.on("close")` and total/idle timers. Idle timer resets on each data chunk. |
 | `reasoning_cache_miss` | Degraded, not broken. Warning logged as `errorCode`. |
-| `body_too_large` | 413 with `request_too_large`. `drainRejectedUpload()` lets remaining upload drain via FIN rather than RST. `body_too_large` is a **server-local `BufferBodyError`** — deliberately excluded from `ProxyError` so `proxyErrorToAnthropic` can never be called with it. |
-| `client_disconnected` | Client is gone — no HTTP response sent. Also a `BufferBodyError`, not a `ProxyError`. |
+| Over-window body (Codex-bound) | 413 with `request_too_large`. `drainRejectedUpload()` lets remaining upload drain via FIN rather than RST. The relay is the origin on the Codex leg and cannot translate a body it cannot hold — 413 is authoritative here (ADR-010). `IngestError` has no `body_too_large` variant; the 413 is emitted in the dispatch switch. |
+| `client_disconnected` | Client is gone — no HTTP response sent. Single variant of `IngestError` (module-local, `server.ts`). Excluded from `ProxyError` so `proxyErrorToAnthropic` can never be called with it. |
 
 ## Anti-Patterns
 
@@ -317,7 +319,7 @@ IncomingMessage (Anthropic wire)
 
 ## Key Files
 
-- `src/server.ts` — Wiring site for resolve→route→send; `buildDeps` calls `buildRoutingTable` once; `deps.resolve` closure; `deps.providers[decision.provider].handleMessages` dispatch; ambiguous fail-open policy; `BufferBodyError` (server-local, not `ProxyError`); `applyInboundPolicy` (from `src/inbound-policy.ts`) owns `SERVER_TUNING` + `clientError` handler
+- `src/server.ts` — Wiring site for resolve→route→send; `buildDeps` calls `buildRoutingTable` once; `deps.resolve` closure; `deps.providers[decision.provider].handleMessages` dispatch; ambiguous fail-open policy; `IngestError` (server-local, single variant `client_disconnected`, not `ProxyError`); `readBodyForRouting` + over-window routing (Anthropic→stream, Codex→413); `drainRejectedUpload` in `dispatch().catch` for paused-req safety; `applyInboundPolicy` (from `src/inbound-policy.ts`) owns `SERVER_TUNING` + `clientError` handler
 - `src/models.ts` — Pure registry module (no repo imports); `MODEL_REGISTRY`, `PROVIDER_IDS`, `AliasesByProvider`, `buildRoutingTable`, `resolveModel`, `isReservedAnthropicName`, `routableModelCount`, `formatModelsReport`, `buildModelRows`, `buildAliasRows`
 - `src/router.ts` — Pure routing decision; accepts `ModelResolution` (not raw string); zero name matching; exhaustive switch; classification only — policy lives in server.ts
 - `src/codex-handler.ts` — `createCodexHandler<P>(deps): ProviderHandler` entry point; `CodexHandlerDeps<P>`, `CodexTransportConstants` interface; `buildHeaders` (exported pure module-level fn); canonical substitution; sessionId before loop; bounded retry; `AbortController` above `auth.getCredentials()`; `handleCountTokens` (estimate, not forwarded)

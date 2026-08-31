@@ -32,7 +32,7 @@
  *
  * On amplification: it is ~2x here, not the ~3x reported from shared-process harnesses.
  * The buffered chunk list and the `Buffer.concat` result are both live at the same
- * moment in `bufferBody` (src/server.ts), and the UTF-8 string plus the parsed object
+ * moment in `readBodyForRouting` (src/server.ts), and the UTF-8 string plus the parsed object
  * graph supply the heap term (+4.0 MiB/request). It is decidedly not 1x, so wire size
  * alone is not the memory cost.
  *
@@ -560,8 +560,15 @@ const runBench = async (): Promise<number> => {
   console.log();
 
   if (bodyBytes > maxBodyBytes) {
-    console.error(`BODY_MIB exceeds limits.maxBufferedBodyBytes — the relay will answer 413 and the run will fail.`);
-    return finish(1);
+    // For Anthropic-bound traffic, over-window bodies are now streamed (not 413'd).
+    // This bench targets the buffered path (complete bodies within the window), so
+    // results for over-window runs measure the prefix-buffer profile rather than the
+    // full-buffer profile.  Warn and continue rather than abort.
+    console.warn(
+      `BODY_MIB (${bodyMib.toFixed(1)}) exceeds limits.maxBufferedBodyBytes (${formatMiB(maxBodyBytes)}).` +
+        " Anthropic-bound traffic will be streamed (only MODEL_SNIFF_BYTES prefix buffered)." +
+        " Memory numbers reflect the streaming profile, not the fully-buffered baseline.",
+    );
   }
 
   const agent = new http.Agent({ keepAlive: false, maxSockets: concurrency + 4 });

@@ -1300,7 +1300,7 @@ describe("anthropic passthrough — drainRejectedUpload cuts off a client that i
 // ---------------------------------------------------------------------------
 // B8: a client that vanishes mid-upload is not recorded as a completed 200
 //
-// bufferBody's `client_disconnected` outcome writes nothing to `res`, so at close
+// readBodyForRouting's `client_disconnected` outcome writes nothing to `res`, so at close
 // time `res.statusCode` is Node's 200 initialiser rather than a status the relay
 // sent.  Recording `request_complete status=200` for a request that never received
 // a response makes an abort indistinguishable from a success in the one line an
@@ -1335,7 +1335,7 @@ describe("server body ingestion — a client that vanishes mid-upload is not log
 
     await new Promise<void>((resolve) => {
       const socket = net.connect(Number(port), "127.0.0.1", () => {
-        // Declared length is under maxBodyBytes, so the streaming path is the one
+        // Declared length is under maxBufferedBodyBytes, so the streaming path is the one
         // exercised; only a fraction of it is ever sent.
         socket.write(
           `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
@@ -1446,6 +1446,8 @@ describe("server body ingestion — over-window body handling (B9)", () => {
   it("a chunked oversized body bound for Anthropic streams through to the origin", async () => {
     // Non-vacuity: RED against the old bufferBody path that returned body_too_large
     // on the streaming accumulation trip — the relay answered 413 instead of forwarding.
+    // Model key is the first field in the body so sniff resolves → anthropic:streamed
+    // (not fail-open) — verifying the identified-model streaming path, not just fail-open.
     const MAX_BODY = 1024;
     const { anthropic, subswitch } = await setup(
       (_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); },
@@ -1453,6 +1455,8 @@ describe("server body ingestion — over-window body handling (B9)", () => {
     );
     const { port } = new URL(subswitch.url);
 
+    const modelHeader = `{"model":"claude-sonnet-4-6","pad":"`;
+    const piece = "x".repeat(512);
     const reply = await readReply(
       port,
       (socket) => {
@@ -1460,11 +1464,11 @@ describe("server body ingestion — over-window body handling (B9)", () => {
           `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
             `content-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n`,
         );
-        const piece = "x".repeat(512);
+        // First chunk: model key-value at the start → sniff resolves to Anthropic.
         // Four 512-byte chunks cross the 1 KiB window with no Content-Length.
-        // Model is Anthropic (no "codex:" prefix) so streaming path applies.
-        socket.write(`${(8).toString(16)}\r\n{"model"\r\n`);
+        socket.write(`${modelHeader.length.toString(16)}\r\n${modelHeader}\r\n`);
         for (let i = 0; i < 4; i += 1) socket.write(`${(512).toString(16)}\r\n${piece}\r\n`);
+        socket.write(`2\r\n"}\r\n`); // closing quote + brace
         socket.write("0\r\n\r\n");
       },
       3_000,
@@ -1956,10 +1960,16 @@ describe("server body ingestion — over-window streaming edge cases (B15)", () 
     // First HTTP chunk = 1025 decoded bytes, no "model" key → trips over_window.
     // sniff scans prefix[0..MODEL_SNIFF_BYTES] = prefix[0..1024] (the 1025-byte chunk) →
     // no "model" key → undefined → fail open to Anthropic streaming path → 200.
-    const { anthropic, subswitch } = await setup(
+    // Route label: "anthropic:streamed:unsniffed"; bodyMode: "streamed".
+    const captured: Array<{ event: string; fields: Record<string, unknown> }> = [];
+    const anthropic = await startFakeUpstream(
       (_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); },
-      { maxBufferedBodyBytes: 1024 },
     );
+    const subswitch = await startSubswitch(
+      { anthropic: { baseUrl: anthropic.url }, limits: { maxBufferedBodyBytes: 1024 } },
+      { logger: { log(_level: string, event: string, fields: Record<string, unknown> = {}) { captured.push({ event, fields }); } } },
+    );
+    cleanups.push(subswitch.close, anthropic.close);
     const { port } = new URL(subswitch.url);
 
     // First HTTP chunk: 1025 bytes, all padding — "model" key is absent.
@@ -1995,6 +2005,17 @@ describe("server body ingestion — over-window streaming edge cases (B15)", () 
       1,
       "the body must reach the Anthropic upstream on the fail-open path",
     );
+
+    // Allow res.on("close") to fire so request_complete is logged.
+    await new Promise<void>((r) => setTimeout(r, 50));
+    const complete = captured.find((e) => e.event === "request_complete");
+    assert.ok(complete !== undefined, `request_complete must be logged; got ${JSON.stringify(captured)}`);
+    assert.equal(
+      complete.fields.route,
+      "anthropic:streamed:unsniffed",
+      "fail-open over-window body must use anthropic:streamed:unsniffed route label",
+    );
+    assert.equal(complete.fields.bodyMode, "streamed", "fail-open over-window body must carry bodyMode=streamed");
   });
 
   it("a body exactly at the window boundary takes the complete path, not the sniff path", async () => {
@@ -2077,38 +2098,165 @@ describe("server body ingestion — over-window streaming edge cases (B15)", () 
       0,
       `client disconnect on the prefix path must NOT emit anthropic_upstream_error; got: ${JSON.stringify(upstreamErrors)}`,
     );
+    // Positive assertion: the relay actually started forwarding to the upstream before the
+    // client disconnected — the abort is real work stopped mid-flight, not a silent drop.
+    assert.equal(
+      fakeUpstream.requests.length,
+      1,
+      "relay must have initiated one upstream request before the client aborted",
+    );
   });
 
   it("over-window body arrives byte-identical at the upstream across the prefix seam", async () => {
-    // Non-vacuity: RED against a bug where prefix bytes are written twice (once via
-    // upstream.write(consumed.bytes) and once leaked through pipe), or where the seam
-    // drops bytes — the upstream body would diverge from sentBody and the strict-equal
-    // assertion would fail.
+    // Non-vacuity: RED against prefix duplication (bytes written twice — once via
+    // upstream.write(consumed.bytes) and once leaked through pipe) or byte drop at the
+    // seam — the upstream body would diverge from sentBody and the strict-equal assertion
+    // would fail.
     //
-    // Uses fetch (Content-Length = body.length, declared > window) so the relay reads
-    // up to min(MODEL_SNIFF_BYTES, window) = 1024 bytes before the over_window trip,
-    // writes the prefix to upstream, then pipes the remainder via req.pipe(upstream).
-    const WINDOW = 1024;
-    const sentBody = `{"model":"claude-sonnet-4-6","pad":"${"x".repeat(4000)}"}`;
-    // body.length ≈ 4038 >> WINDOW. "model" is the first key → Anthropic streaming path.
+    // Uses raw TCP so the body arrives in two separate writes: the first write exceeds
+    // the routing window and trips the over_window branch (prefix forwarded via write),
+    // and the second write arrives after a delay and must flow through pipe() — it cannot
+    // be in the prefix because it has not arrived yet when the trip fires.  A fetch()-based
+    // test is vacuous here: the runtime sends the full body as one segment, so the entire
+    // body ends up in the prefix and pipe() carries nothing.
+    //
+    // Route label: "anthropic:streamed" (sniff resolves model); bodyMode: "streamed".
+    const WINDOW = 512;
+    const modelHeader = `{"model":"claude-sonnet-4-6","data":"`;
+    // First write: model header + padding.  Length must exceed WINDOW so over_window trips.
+    const firstPayload = modelHeader + "A".repeat(WINDOW + 100 - modelHeader.length);
+    assert.ok(firstPayload.length > WINDOW, "pre-condition: firstPayload must exceed the routing window");
+    // Second write: additional padding + closing.  Sent after a delay so pipe() must carry it.
+    const secondPayload = "B".repeat(80) + '"}';
+    const sentBody = firstPayload + secondPayload;
 
-    const { anthropic, subswitch } = await setup(
+    const captured: Array<{ event: string; fields: Record<string, unknown> }> = [];
+    const anthropic = await startFakeUpstream(
       (_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); },
-      { maxBufferedBodyBytes: WINDOW },
+    );
+    const subswitch = await startSubswitch(
+      { anthropic: { baseUrl: anthropic.url }, limits: { maxBufferedBodyBytes: WINDOW } },
+      { logger: { log(_level: string, event: string, fields: Record<string, unknown> = {}) { captured.push({ event, fields }); } } },
+    );
+    cleanups.push(subswitch.close, anthropic.close);
+    const { port } = new URL(subswitch.url);
+
+    const reply = await readReply(
+      port,
+      (socket) => {
+        socket.write(
+          `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+            `content-type: application/json\r\ncontent-length: ${sentBody.length}\r\n\r\n`,
+        );
+        socket.write(firstPayload);
+        // Delay second write so the relay has tripped over_window and set up pipe() before
+        // the bytes arrive — pipe() must carry them, not the prefix write.
+        setTimeout(() => socket.write(secondPayload), 30);
+      },
+      3_000,
     );
 
-    const response = await fetch(`${subswitch.url}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: sentBody,
-    });
-
-    assert.equal(response.status, 200, "over-window Anthropic body must reach the upstream → 200");
+    assert.match(reply, /^HTTP\/1\.1 200 /, `over-window Anthropic body must reach the upstream → 200; got: ${JSON.stringify(reply.split("\r\n")[0])}`);
+    assert.ok(!reply.includes("x-subswitch-synthesized: 1"), "a forwarded response must NOT carry the synthesized marker");
     assert.equal(anthropic.requests.length, 1, "upstream must receive exactly one request");
     assert.equal(
       anthropic.requests[0]!.body.toString("utf8"),
       sentBody,
       "body at the upstream must be byte-identical to what the client sent across the prefix seam",
+    );
+
+    // Allow res.on("close") to fire so request_complete is logged.
+    await new Promise<void>((r) => setTimeout(r, 50));
+    const complete = captured.find((e) => e.event === "request_complete");
+    assert.ok(complete !== undefined, `request_complete must be logged; got ${JSON.stringify(captured)}`);
+    assert.equal(
+      complete.fields.route,
+      "anthropic:streamed",
+      "sniff-resolved over-window body must use anthropic:streamed route label",
+    );
+    assert.equal(complete.fields.bodyMode, "streamed", "over-window body must carry bodyMode=streamed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B16: dispatch().catch drains a paused over-window body
+//
+// When dispatch() rejects while req was paused mid-upload (over_window trip),
+// drainRejectedUpload(req) must be called so the socket is not left wedged.
+// Without the drain, req stays paused indefinitely and the client's TCP send
+// buffer fills, blocking its write() call until requestTimeout (10 min).
+//
+// Non-vacuity: RED against the pre-fix code path that omitted drainRejectedUpload
+// in dispatch().catch — the socket would stay paused and the client's write would
+// never complete.  With the drain, the client's write completes promptly and the
+// socket closes within a short window after the 500 response.
+// ---------------------------------------------------------------------------
+
+describe("server body ingestion — dispatch rejection drains paused over-window body (B16)", () => {
+  it("dispatch() rejection drains a paused over-window body so the socket does not wedge", async () => {
+    // Inject a forwardAnthropic that throws synchronously.  When dispatch() receives an
+    // over_window ingest result it calls forwardAnthropic; the injected throw rejects the
+    // dispatch() promise, reaching the .catch handler.  Without drainRejectedUpload in
+    // the .catch handler, req stays paused and the client's upload hangs indefinitely.
+    const config = loadConfig({
+      configPath: "inline-test-config.json",
+      readFile: () => JSON.stringify({ logLevel: "error", anthropic: { baseUrl: "http://127.0.0.1:1" } }),
+    });
+    if (!config.ok) throw new Error(`config load failed: ${config.error.message}`);
+    const depsResult = buildDeps(config.value.config);
+    if (!depsResult.ok) throw new Error(`buildDeps failed: ${depsResult.error}`);
+    const throwingForwardAnthropic: AnthropicForwarder = () => {
+      throw new Error("injected failure — testing dispatch().catch drain");
+    };
+    const server = createProxyServer({ ...depsResult.value, forwardAnthropic: throwingForwardAnthropic });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = (server.address() as AddressInfo);
+    cleanups.push(() => new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); }));
+
+    // Send a declared-over-window body in two writes.  The first write trips over_window
+    // → req.pause() → forwardAnthropic throws → dispatch().catch fires.  drainRejectedUpload
+    // must resume req so the second write can drain and the socket closes.
+    const WINDOW = 512;
+    const firstPayload = '{"model":"claude-sonnet-4-6","pad":"' + "A".repeat(WINDOW + 50);
+    const secondPayload = "B".repeat(100) + '"}';
+    const totalLength = firstPayload.length + secondPayload.length;
+
+    const timeline = await new Promise<{ reply: string; secondWriteMs: number }>((resolve, reject) => {
+      const socket = net.connect(Number(port), "127.0.0.1", () => {
+        socket.write(
+          `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+            `content-type: application/json\r\ncontent-length: ${totalLength}\r\n\r\n`,
+        );
+        socket.write(firstPayload);
+
+        // Second write after 40 ms — must drain promptly once drainRejectedUpload resumes req.
+        const writeStart = Date.now();
+        setTimeout(() => {
+          socket.write(secondPayload, () => {
+            resolve({ reply: collected, secondWriteMs: Date.now() - writeStart });
+          });
+        }, 40);
+      });
+
+      let collected = "";
+      socket.on("data", (chunk: Buffer) => { collected += chunk.toString("utf8"); });
+      socket.on("error", () => { /* EPIPE/RST after relay closes; reply already collected */ });
+
+      const giveUp = setTimeout(() => {
+        socket.destroy();
+        reject(new Error("socket did not drain within 3 s — req may still be wedged (missing drainRejectedUpload in dispatch().catch)"));
+      }, 3_000);
+      giveUp.unref();
+    });
+
+    assert.ok(
+      timeline.reply.includes("HTTP/1.1 500"),
+      `dispatch() rejection must produce a 500 response; got: ${JSON.stringify(timeline.reply.slice(0, 200))}`,
+    );
+    assert.ok(
+      timeline.secondWriteMs < 2_000,
+      `second write must complete within 2 s (drain unblocks it); took ${timeline.secondWriteMs} ms — ` +
+        `a timeout here means req is still paused (missing drainRejectedUpload in dispatch().catch)`,
     );
   });
 });

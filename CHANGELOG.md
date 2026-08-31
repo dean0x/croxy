@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - **`limits.maxBodyBytes` no longer applies to Anthropic-bound request bodies; renamed to `limits.maxBufferedBodyBytes`.** The relay buffers up to this many bytes to read the `model` field and route the request; a larger body is now streamed to `api.anthropic.com` verbatim instead of being answered with a relay-synthesized `413 request_too_large`, because Anthropic enforces its own payload limits with authoritative errors and a proxy-invented 413 misattributes proxy policy as upstream state (ADR-010). A body above the window whose leading `model` resolves to a translated provider (Codex) still returns `413 request_too_large` — on that leg subswitch *is* the origin and cannot translate a body it cannot hold.
-- **BREAKING:** a config containing `limits.maxBodyBytes` refuses to start with a message naming the replacement key. Peak memory for over-window uploads drops from ~2× the body to a bounded prefix plus stream backpressure.
+- **BREAKING:** a config containing `limits.maxBodyBytes` refuses to start with a message naming the replacement key. Peak memory for Anthropic-bound requests with a declared-over-window Content-Length drops from ~2× the body to a bounded ~8 KiB prefix plus stream backpressure; for chunked or undeclared over-window bodies, the relay still buffers up to one routing window plus one socket read before the trip fires.
 
 ## [0.3.0] - 2026-08-20
 

@@ -345,7 +345,10 @@ When a client sends a body larger than `limits.maxBufferedBodyBytes` to a transl
 closing the connection. This lets the client read the 413 response; without the drain, the
 TCP write-buffer fills and the client's `recv()` never sees the 413 body. For
 Anthropic-bound bodies above the window, subswitch streams the body verbatim and Anthropic
-enforces its own payload limits with authoritative errors.
+enforces its own payload limits with authoritative errors. Note that to route an over-window
+body the relay must read enough bytes to identify the model; a client that declares a large
+Content-Length and then dribbles data slowly will hold the connection open until
+`server.requestTimeout` (10 min) — this is inherent to needing the model name for routing.
 
 ### Token counting on the Codex leg
 
