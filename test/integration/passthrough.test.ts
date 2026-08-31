@@ -106,9 +106,9 @@ describe("anthropic passthrough", () => {
     assert.equal(anthropic.requests[1]!.url, "/v1/models?limit=5");
   });
 
-  // Non-vacuity: RED against the old bufferBody path that returned body_too_large
-  // instead of over_window, which caused the relay to synthesize 413 for every
-  // large Anthropic-bound body instead of streaming it through.
+  // Non-vacuity: RED against a regression where oversized bodies returned
+  // body_too_large instead of over_window, which caused the relay to synthesize
+  // 413 instead of streaming it through.
   it("streams an oversized Anthropic-bound body to the origin instead of synthesizing 413", async () => {
     const sentBody = `{"model":"claude-sonnet-4-6","padding":"${"x".repeat(4096)}"}`;
     const { anthropic, subswitch } = await setup(
@@ -1444,8 +1444,8 @@ describe("server body ingestion — over-window body handling (B9)", () => {
   });
 
   it("a chunked oversized body bound for Anthropic streams through to the origin", async () => {
-    // Non-vacuity: RED against the old bufferBody path that returned body_too_large
-    // on the streaming accumulation trip — the relay answered 413 instead of forwarding.
+    // Non-vacuity: RED against a regression where streaming oversized bodies
+    // returned body_too_large — the relay would have answered 413 instead of forwarding.
     // Model key is the first field in the body so sniff resolves → anthropic:streamed
     // (not fail-open) — verifying the identified-model streaming path, not just fail-open.
     const MAX_BODY = 1024;

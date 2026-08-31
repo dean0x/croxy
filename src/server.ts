@@ -444,8 +444,8 @@ export const createProxyServer = (deps: ServerDeps): Server => {
       //
       // Placed above the /__subswitch/* branch deliberately: those endpoints are
       // relay-owned, disclose its topology, and are exactly as reachable from a
-      // rebound page as /v1/messages is.  Placed above bufferBody so a rejected upload
-      // is never accumulated.
+      // rebound page as /v1/messages is.  Placed above readBodyForRouting so a rejected
+      // upload is never accumulated.
       const gate = hostGateVerdict(req.headers);
       if (gate.kind === "reject") {
         route = "host_rejected";
