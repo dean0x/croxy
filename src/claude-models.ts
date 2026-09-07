@@ -1,0 +1,68 @@
+/** The destination registry for Codex ingress. Forward-ingress reservation rules stay independent. */
+import { compareGen } from "./models.js";
+export interface ClaudeModel {
+  readonly id: string;
+  readonly family: string;
+  readonly gen: readonly number[];
+  readonly contextWindow: number;
+  readonly maxOutputTokens: number;
+}
+
+export const CLAUDE_MODELS: readonly ClaudeModel[] = [
+  { id: "claude-sonnet-5", family: "sonnet", gen: [5], contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+  { id: "claude-opus-5", family: "opus", gen: [5], contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+  { id: "claude-fable-5", family: "fable", gen: [5], contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+  { id: "claude-fable-5-1", family: "fable", gen: [5, 1], contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+];
+
+export const isOpenaiModelName = (name: string): boolean => /^(gpt-|o[134](?:-|$)|codex:|sol(?:$|\[)|terra(?:$|\[)|luna(?:$|\[))/i.test(name);
+
+export function claudeResolver(aliases: Readonly<Record<string, string>>) {
+  const names = new Map<string, string>();
+  const families = new Map<string, ClaudeModel>();
+  for (const model of CLAUDE_MODELS) {
+    names.set(model.id, model.id); names.set(`claude:${model.id}`, model.id);
+    const current = families.get(model.family);
+    if (!current || compareGen(model.gen, current.gen) > 0) families.set(model.family, model);
+  }
+  for (const model of families.values()) { names.set(model.family, model.id); names.set(`claude:${model.family}`, model.id); }
+  for (const [name, target] of Object.entries(aliases)) {
+    if (isOpenaiModelName(name) || isOpenaiModelName(target) || !target.startsWith("claude-")) throw new Error("invalid_claude_alias");
+    names.set(name, target); names.set(target, target); names.set(`claude:${name}`, target);
+  }
+  // Canonical IDs retain precedence over aliases, matching the forward resolver.
+  for (const id of [...CLAUDE_MODELS.map(model => model.id), ...Object.values(aliases)]) {
+    names.set(id, id); names.set(`claude:${id}`, id);
+  }
+  return (name: string): string | undefined => names.get(name);
+}
+
+export function claudeModelRows(aliases: Readonly<Record<string, string>>) {
+  const resolve = claudeResolver(aliases);
+  const ids = new Set([...CLAUDE_MODELS.map(model => model.id), ...Object.values(aliases)]);
+  return [...ids].map(id => ({ id, provider: "claude", registered: CLAUDE_MODELS.some(model => model.id === id), aliases: [...new Set([
+    ...CLAUDE_MODELS.filter(model => model.id === id && resolve(model.family) === id).map(model => model.family),
+    ...Object.entries(aliases).filter(([, target]) => target === id).map(([name]) => name),
+  ])] }));
+}
+
+/** Preserve OpenAI's evolving catalog and derive only the native tool-surface fields for Claude. */
+export function augmentCodexModels(body: Record<string, unknown>, aliases: Readonly<Record<string, string>>): Record<string, unknown> {
+  const models = Array.isArray(body["models"]) ? body["models"] as Record<string, unknown>[] : undefined;
+  if (!models?.length) return body;
+  const template = models.find(model => model["tool_mode"] === "code_mode_only") ?? models[0]!;
+  const present = new Set(models.map(model => model["slug"]));
+  const additions = claudeModelRows(aliases).flatMap(row => {
+    const capability = CLAUDE_MODELS.find(model => model.id === row.id);
+    if (!capability) return []; // Custom aliases route, but unverified capabilities are not advertised.
+    return [row.id, ...row.aliases].filter(slug => !present.has(slug)).map(slug => ({
+      ...template, slug, display_name: slug, description: `Claude via SubSwitch (${row.id})`, supported_in_api: true,
+      context_window: capability.contextWindow, max_context_window: capability.contextWindow,
+      default_reasoning_level: "high", supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max"].map(effort => ({ effort, description: effort })),
+      model_messages: null, base_instructions: "You are a coding assistant running in Codex. Follow the user's task and the native tool definitions.",
+      supports_search_tool: false, input_modalities: ["text"], additional_speed_tiers: [],
+      service_tiers: [], default_service_tier: null,
+    }));
+  });
+  return { ...body, models: [...models, ...additions] };
+}

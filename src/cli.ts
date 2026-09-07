@@ -18,6 +18,7 @@ import {
 import { MODEL_REGISTRY, formatModelsReport, buildModelRows, routableModelCount, PROVIDER_IDS } from "./models.js";
 import { resolveColorEnabled } from "./tty.js";
 import { SUBSWITCH_NAME, SUBSWITCH_VERSION } from "./version.js";
+import { claudeModelRows } from "./claude-models.js";
 
 const SHUTDOWN_GRACE_MS = 5000;
 
@@ -40,7 +41,7 @@ const fail = (message: string): void => {
 // ---------------------------------------------------------------------------
 
 const USAGE = `\
-subswitch — local subscription-routing proxy for Claude Code
+subswitch — local subscription-routing proxy for Claude Code and Codex
 
 Usage: subswitch [command] [flags]
 
@@ -67,6 +68,10 @@ Flags (init):
       --settings-target <t>  "local" (.claude/settings.local.json, default)
                              or "shared" (.claude/settings.json)
 
+Flags (init, doctor, models):
+      --client <client>     "claude-code", "codex", or "both"
+                            init/models default to claude-code; doctor checks configured paths
+
 Examples:
   subswitch serve                      # start proxy on port ${DEFAULT_PORT}
   subswitch serve --port 8080          # start proxy on a custom port
@@ -86,20 +91,21 @@ Environment:
 // Typed CLI command union (A3.18)
 // ---------------------------------------------------------------------------
 
+type Client = "claude-code" | "codex" | "both";
 type CliCommand =
   | { readonly kind: "help" }
   | { readonly kind: "version" }
   | { readonly kind: "serve"; readonly verbose: boolean; readonly quiet: boolean; readonly port?: string }
-  | { readonly kind: "doctor" }
-  | { readonly kind: "models"; readonly json: boolean }
-  | { readonly kind: "init"; readonly yes: boolean; readonly dryRun: boolean; readonly flags: InitFlags };
+  | { readonly kind: "doctor"; readonly client: Client }
+  | { readonly kind: "models"; readonly json: boolean; readonly client: Client }
+  | { readonly kind: "init"; readonly yes: boolean; readonly dryRun: boolean; readonly flags: InitFlags; readonly client: Client };
 
 // Flag sets per command — used for per-command validation (A3.19)
 const GLOBAL_FLAGS = new Set(["help", "version"]);
 const SERVE_FLAGS = new Set(["verbose", "quiet", "port"]);
-const DOCTOR_FLAGS = new Set<string>();
-const MODELS_FLAGS = new Set(["json"]);
-const INIT_FLAGS = new Set(["yes", "dry-run", "port", "settings-target"]);
+const DOCTOR_FLAGS = new Set(["client"]);
+const MODELS_FLAGS = new Set(["json", "client"]);
+const INIT_FLAGS = new Set(["yes", "dry-run", "port", "settings-target", "client"]);
 
 /**
  * Pure: parse process.argv slice into a typed CliCommand.
@@ -123,6 +129,7 @@ const parseCliArgs = (argv: string[]): { ok: true; value: CliCommand } | { ok: f
         "settings-target": { type: "string" },
         // models flags
         json:              { type: "boolean" },
+        client:            { type: "string" },
       },
       allowPositionals: true,
       strict: true,
@@ -136,6 +143,9 @@ const parseCliArgs = (argv: string[]): { ok: true; value: CliCommand } | { ok: f
     if (values.version === true) return { ok: true, value: { kind: "version" } };
 
     const command = positionals[0] ?? "serve";
+    if (values.client !== undefined && !["claude-code", "codex", "both"].includes(values.client))
+      return { ok: false, error: { message: "client must be claude-code, codex, or both" } };
+    const client = (values.client ?? (command === "doctor" ? "both" : "claude-code")) as Client;
 
     // Unknown command
     if (command !== "serve" && command !== "doctor" && command !== "init" && command !== "models") {
@@ -178,6 +188,7 @@ const parseCliArgs = (argv: string[]): { ok: true; value: CliCommand } | { ok: f
         ok: true,
         value: {
           kind: "init",
+          client,
           yes: values.yes === true,
           dryRun: values["dry-run"] === true,
           flags: {
@@ -203,11 +214,11 @@ const parseCliArgs = (argv: string[]): { ok: true; value: CliCommand } | { ok: f
     }
 
     if (command === "doctor") {
-      return { ok: true, value: { kind: "doctor" } };
+      return { ok: true, value: { kind: "doctor", client } };
     }
 
     // command === "models"
-    return { ok: true, value: { kind: "models", json: values.json === true } };
+    return { ok: true, value: { kind: "models", json: values.json === true, client } };
   } catch (e) {
     // Translate parseArgs throw to Result err (A3.21)
     if (e instanceof Error) {
@@ -298,6 +309,10 @@ const serve = async (
     const hostSuffix = host !== "" ? `  → ${host}` : "";
     errOut(`  ${id.padEnd(8)}  ${modelCount} model${modelCount === 1 ? "" : "s"}${hostSuffix}`);
   }
+  if (effectiveConfig.codexIngress.enabled) {
+    errOut(effectiveConfig.codexIngress.claude.enabled ? "  codex ingress  OpenAI passthrough + Claude model routing (HTTP/WebSocket)" :
+      "  codex ingress  native OpenAI passthrough (HTTP/WebSocket); Claude translation unavailable");
+  }
   errOut(`  run \`subswitch doctor\` to verify setup\n`);
 
   const shutdown = (): void => {
@@ -314,13 +329,13 @@ const serve = async (
 // doctor
 // ---------------------------------------------------------------------------
 
-const doctor = async (result: LoadConfigResult): Promise<void> => {
+const doctor = async (result: LoadConfigResult, client: Client): Promise<void> => {
   const color = resolveColorEnabled(
     process.env as Record<string, string | undefined>,
     process.stdout.isTTY === true,
   );
 
-  process.exitCode = await runDoctor(
+  process.exitCode = client === "codex" ? 0 : await runDoctor(
     result.config,
     result.configPath,
     result.fileFound,
@@ -336,6 +351,10 @@ const doctor = async (result: LoadConfigResult): Promise<void> => {
     // Only providers the user wrote into the config file can fail the exit code. (avoids PF-006)
     result.configuredProviders,
   );
+  if (client === "codex" || (client === "both" && result.config.codexIngress.claude.enabled)) {
+    const { runCodexDoctor } = await import("./codex-doctor.js");
+    process.exitCode = Math.max(Number(process.exitCode ?? 0), await runCodexDoctor(result.config, out));
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -350,7 +369,7 @@ const doctor = async (result: LoadConfigResult): Promise<void> => {
  *
  * Never writes credentials, tokens, PII, or secrets. [compliance]
  */
-const modelsJson = (result: LoadConfigResult): void => {
+const modelsJson = (result: LoadConfigResult, client: Client): void => {
   const { config, configPath, fileFound } = result;
   const rows = buildModelRows(MODEL_REGISTRY, aliasesByProvider(config));
 
@@ -374,10 +393,19 @@ const modelsJson = (result: LoadConfigResult): void => {
     models: rows,
   };
 
-  out(JSON.stringify(payload));
+  const reverse = { kind: "models", schemaVersion: 2, client: "codex", subswitchVersion: SUBSWITCH_VERSION,
+    fallbackProvider: "codex", enabled: config.codexIngress.enabled && config.codexIngress.claude.enabled,
+    models: claudeModelRows(config.codexIngress.claude.aliases) };
+  out(JSON.stringify(client === "codex" ? reverse : client === "both" ? { kind: "models", schemaVersion: 2, clients: { "claude-code": payload, codex: reverse } } : payload));
 };
 
-const models = (config: Config): void => {
+const models = (config: Config, client: Client): void => {
+  if (client === "both") { models(config, "claude-code"); models(config, "codex"); return; }
+  if (client === "codex") {
+    out(`subswitch models — Codex → Claude (${config.codexIngress.enabled && config.codexIngress.claude.enabled ? "enabled" : "disabled"})`);
+    for (const row of claudeModelRows(config.codexIngress.claude.aliases)) out(`  ${row.id}${row.aliases.length ? `  ${row.aliases.join(", ")}` : ""}`);
+    return;
+  }
   const color = resolveColorEnabled(
     process.env as Record<string, string | undefined>,
     process.stdout.isTTY === true,
@@ -415,6 +443,23 @@ const runInit = async (command: Extract<CliCommand, { kind: "init" }>): Promise<
   const projectDir = process.cwd();
   const fsDeps = makeRealFsDeps();
   const env = process.env as Record<string, string | undefined>;
+
+  if (command.client !== "claude-code") {
+    const decision = resolveInitDispatch(process.stdin.isTTY === true, process.stdout.isTTY === true, "CI" in env, command.yes);
+    if (!command.dryRun && decision === "refuse") { fail("no interactive terminal detected. Re-run with --yes, or preview with --dry-run."); return; }
+    let port = command.flags.port;
+    if (!command.dryRun && decision === "interactive") {
+      const prompts = await makeClackPrompts(); prompts.intro("SubSwitch Codex setup");
+      const selected = await prompts.text({ message: "Proxy port", initialValue: port ?? String(DEFAULT_PORT), validate: value => PortSchema.safeParse(value).success ? undefined : "Use a port between 1 and 65535" });
+      if (prompts.isCancel(selected)) { prompts.cancel("Setup cancelled"); process.exitCode = 1; return; }
+      port = String(selected);
+    }
+    const { runNativeInit } = await import("./codex-init.js");
+    await runNativeInit({ client: command.client, dryRun: command.dryRun,
+      ...(port === undefined ? {} : { port }), ...(command.flags.settingsTarget === undefined ? {} : { settingsTarget: command.flags.settingsTarget }),
+    }, fsDeps, env, projectDir, out);
+    return;
+  }
 
   // --dry-run: always use non-interactive planning path; no TTY check required
   // because it writes nothing — the fail-closed contract only protects writes. [F34]
@@ -486,7 +531,7 @@ const main = async (): Promise<void> => {
         fail(configResult.error.message);
         return;
       }
-      await doctor(configResult.value);
+      await doctor(configResult.value, command.client);
       return;
     }
 
@@ -498,10 +543,10 @@ const main = async (): Promise<void> => {
       }
       // JSON branch returns before resolveColorEnabled — FORCE_COLOR cannot bleed into JSON. [7b]
       if (command.json) {
-        modelsJson(configResult.value);
+        modelsJson(configResult.value, command.client);
         return;
       }
-      models(configResult.value.config);
+      models(configResult.value.config, command.client);
       return;
     }
 

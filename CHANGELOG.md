@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Opt-in native Codex → Claude routing for Sonnet, Opus and Fable, while OpenAI
+  models continue to OpenAI and Codex retains native agents, tools and permissions.
+- Subscription authentication, credential refresh, readable collaboration messages,
+  streamed/non-stream responses, prompt caching and bounded process-local replay.
+- `init`, `doctor` and `models --client codex|both`, native model discovery, and a
+  user configuration fallback. Existing Claude Code setup remains the default.
+- Live native acceptance runners and shared parity follow-ups in issues #45–#48.
+
+### Compatibility
+
+- Reverse routing requires Node 22.15+ for native zstd requests and includes the
+  documented Claude identity preamble. Durable restart/compaction, setup undo and
+  explicit API authentication for translated inference remain separate shared work.
+
 ## [0.4.0] - 2026-09-01
 
 ### Changed

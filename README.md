@@ -4,50 +4,36 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen.svg)](https://nodejs.org/)
 
-**Route Claude Code subagents to a different model - keep everything else on Claude.**
+**Route native sub-agents between Claude Code and Codex, using your subscriptions.**
 
-subswitch is a local subscription-routing proxy for Claude Code. Give a subagent a
-Codex model in its frontmatter (`model: sol`) and *that subagent alone* runs
-on your **Codex subscription**; your main agent and every other request stay on
-your **claude.ai subscription**, untouched. No API keys — subswitch forwards the
-subscription credential each leg already uses.
+SubSwitch is a local protocol bridge. Claude Code can delegate a sub-agent to an
+OpenAI model; Codex can delegate a native sub-agent to a Claude model. Routing is
+selected by the requested model. The originating client keeps its agents, tools,
+permissions, and execution loop.
 
-## Why this is different
+## Model-based routing
 
-Every other Claude Code proxy is all-or-nothing. `ANTHROPIC_BASE_URL` is a single
-global setting, so existing routers point *all* of Claude Code's traffic at one
-endpoint and typically swap the model for the entire session — your orchestrator,
-your utility calls, everything moves at once.
+- **Claude Code → Codex:** registered OpenAI models and aliases are translated to
+  Responses. Other traffic continues to Anthropic as a raw relay.
+- **Codex → Claude:** registered Claude models and aliases are translated to
+  Messages. OpenAI models continue to OpenAI. Reverse-enabled sessions adapt the
+  collaboration namespace so cross-provider task messages are readable.
 
-subswitch is the first proxy that splits traffic **per subagent, by model name**:
-
-- Requests whose `model` resolves to a canonical id in the built-in model
-  registry (by exact match, family alias, or custom alias) are translated and
-  sent to the Codex backend.
-- Everything else — the main agent, background utility calls (token counting,
-  context management), all non-matching models — is relayed to Anthropic as
-  **verbatim bytes**, credentials and all.
-
-So you keep Claude Opus/Sonnet driving the session and delegate a specific
-subagent to GPT for a second opinion, a cheaper worker, or a specialized task —
-without giving up either subscription and without touching an API key.
+SubSwitch does not switch models or billing modes after a failure. Unknown models
+retain their originating provider's fallback behavior. Native settings and client
+binaries are not patched or downgraded.
 
 ```
-Claude Code ──► subswitch (127.0.0.1:4141)
-                  ├─ model ∈ registry ─────► chatgpt.com Codex backend
-                  │    (Anthropic Messages ⇄ OpenAI Responses translation,
-                  │     ~/.codex/auth.json OAuth, reasoning round-trip cache)
-                  └─ everything else ──────► api.anthropic.com
-                       (verbatim byte relay, claude.ai OAuth untouched)
-```
+Claude Code ──► SubSwitch ──► OpenAI for selected OpenAI models
+                         └─► Anthropic for other requests
 
-Routing is by the request body's `model` field, resolved against the built-in
-model registry (by exact id, family alias, or custom alias). Unresolvable models
-pass through to Anthropic; non-matching utility traffic is never misrouted.
+Codex ───────► SubSwitch ──► Anthropic for selected Claude models
+                         └─► OpenAI for other requests
+```
 
 ## Requirements
 
-- Node 22+
+- Node 22+ for the forward bridge; Node 22.15+ for reverse routing (native zstd support)
 - A claude.ai subscription login in Claude Code (no `ANTHROPIC_API_KEY` set)
 - Codex CLI logged in (`codex login` → `~/.codex/auth.json`)
 
@@ -105,7 +91,7 @@ on Claude.
 ### CLI reference
 
 ```
-subswitch — local subscription-routing proxy for Claude Code
+subswitch — local subscription-routing proxy for Claude Code and Codex
 
 Usage: subswitch [command] [flags]
 
@@ -132,6 +118,10 @@ Flags (init):
       --settings-target <t>  "local" (.claude/settings.local.json, default)
                              or "shared" (.claude/settings.json)
 
+Flags (init, doctor, models):
+      --client <client>     "claude-code", "codex", or "both"
+                            init/models default to claude-code; doctor checks configured paths
+
 Examples:
   subswitch serve                      # start proxy on port 4141
   subswitch serve --port 8080          # start proxy on a custom port
@@ -145,6 +135,7 @@ Environment:
   NO_COLOR      Disable color output (also respected as standard)
   FORCE_COLOR   Force color output even when not a TTY
   CI            Non-interactive detection — init refuses without --yes
+
 ```
 
 **Exit codes:**
@@ -191,6 +182,76 @@ npm run serve      # same as `subswitch serve`
 npm run doctor     # same as `subswitch doctor`
 ```
 
+## Codex → Claude
+
+Sign in normally with both clients, then enable the reverse path:
+
+```sh
+subswitch init --client codex
+subswitch serve
+subswitch doctor --client codex
+subswitch models --client codex
+```
+
+`init --client codex --dry-run` previews changes. Use `--yes` for non-interactive
+setup, or `--client both` to configure native Codex and the existing project-level
+Claude Code integration together. The default `init` behavior remains Claude Code.
+
+Codex setup changes only the user-level `openai_base_url` value, preserving other
+TOML settings and comments. It writes SubSwitch's user config to
+`$XDG_CONFIG_HOME/subswitch/config.json` (default `~/.config/subswitch/config.json`).
+Project configuration merges over this fallback; explicit `SUBSWITCH_CONFIG`
+remains authoritative. Start the proxy before launching Codex. Existing custom
+providers are not replaced; an existing upstream override is preserved.
+
+Set the model in a native Codex role file, for example `~/.codex/claude-worker.toml`:
+
+```toml
+model = "sonnet"
+model_reasoning_effort = "medium"
+```
+
+Reference that file from native `~/.codex/config.toml` if the role is not already
+configured:
+
+```toml
+[agents.claude_worker]
+description = "Delegate a task to Claude"
+config_file = "claude-worker.toml"
+```
+
+Use `sonnet`, `opus`, `fable`, or a listed canonical Claude ID. Custom aliases live
+under `codexIngress.claude.aliases`. Canonical IDs retain precedence, and family
+aliases select the newest registered generation, as in the forward resolver.
+Custom targets outside the registry can route but do not gain invented native
+capability metadata; doctor flags them for review. Model registration does not override provider
+account availability. Native model discovery preserves OpenAI's catalog and adds
+Claude entries. API-authenticated native Codex traffic retains its API endpoint;
+translated Claude inference uses the configured subscription, with no billing fallback.
+
+The reverse path uses the existing Claude Keychain/file credential store and
+refreshes it when needed. `codexIngress.claude.configDir` selects a native Claude
+configuration directory; if omitted, `CLAUDE_CONFIG_DIR` and then the native default
+apply. `codexIngress.claude.authFile` explicitly selects a file-backed store.
+Automatic prompt caching is enabled, with cached-token counts and a short hashed
+native thread identifier available in logs. If native Codex omits its bearer token on the local
+endpoint, SubSwitch uses its existing Codex credential manager only when the
+native account ID matches. Incoming credentials are never reused for Claude.
+
+Claude subscription requests include a native identity system preamble. This
+compatibility behavior is explicit; SubSwitch does not forge billing attestations,
+rewrite product names in user instructions, or run a second agent runtime. Provider
+credential-use policies still apply. See [security](SECURITY.md) and the
+[live verification notes](e2e/gates/production-parity.md).
+
+State is process-local in both directions. Durable restart/resume and translated
+compaction are tracked in [#45](https://github.com/dean0x/subswitch/issues/45), setup
+undo in [#46](https://github.com/dean0x/subswitch/issues/46), explicit API auth for
+both translating paths in [#47](https://github.com/dean0x/subswitch/issues/47), and
+broader content/tool support in [#48](https://github.com/dean0x/subswitch/issues/48).
+These are not included in the parity release. Missing reverse continuation state
+produces an explicit error; keep the proxy running during active translated sessions.
+
 ## Effort control
 
 The optional `effort` frontmatter field works on the Codex leg too. Claude Code
@@ -210,7 +271,10 @@ default.
 The config file is located by the following precedence (highest wins):
 
 1. `SUBSWITCH_CONFIG` env var — absolute or `~`-relative path; **missing file is an error**
-2. `subswitch.config.json` in the current working directory — silently uses defaults if absent
+2. `subswitch.config.json` in the current working directory, merged over the user fallback
+3. `$XDG_CONFIG_HOME/subswitch/config.json` (default `~/.config/subswitch/config.json`), then built-in defaults
+
+An explicit `SUBSWITCH_CONFIG` file is authoritative and is not merged with the user fallback.
 
 **An unrecognised key is rejected, not ignored.** Two checks run against the raw file
 before it is parsed, and a hit on either is a hard load failure — subswitch prints the

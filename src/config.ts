@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -6,6 +6,7 @@ import { type Result, ok, err } from "./result.js";
 import type { ProxyError } from "./errors.js";
 import type { LogLevel } from "./logger.js";
 import { isReservedAnthropicName, PROVIDER_IDS, type ProviderId, type AliasesByProvider } from "./models.js";
+import { isOpenaiModelName } from "./claude-models.js";
 
 export const DEFAULT_PORT = 4141 as const;
 
@@ -303,12 +304,59 @@ const LimitsSchema = z
   })
   .prefault({});
 
+const ClaudeProviderSchema = z.strictObject({
+  enabled: z.boolean().default(false),
+  baseUrl: z.url().refine(requireHttpsOrLoopback, { message: HTTPS_REQUIRED_MESSAGE }).default("https://api.anthropic.com"),
+  oauthTokenUrl: z.url().refine(requireHttpsOrLoopback, { message: HTTPS_REQUIRED_MESSAGE }).default("https://platform.claude.com/v1/oauth/token"),
+  configDir: z.string().min(1).optional(),
+  authFile: z.string().min(1).optional(),
+  aliases: z.record(z.string().min(1).max(200), z.string().min(1).max(200)).refine(value =>
+    Object.entries(value).every(([key, target]) => !isOpenaiModelName(key) && !isOpenaiModelName(target) && target.startsWith("claude-")),
+  { message: "Claude aliases must target claude-* IDs and must not claim OpenAI model names" }).default({}),
+  allowCustomUpstream: z.boolean().default(false),
+  requestTimeoutMs: z.number().int().positive().default(600_000),
+  streamIdleTimeoutMs: z.number().int().positive().default(300_000),
+  maxSseEventBytes: z.number().int().positive().default(4 * 1024 * 1024),
+  maxAggregateBytes: z.number().int().positive().default(64 * 1024 * 1024),
+  continuationCache: z.strictObject({ maxEntries: z.number().int().positive().default(4096), maxBytes: z.number().int().positive().default(64 * 1024 * 1024) }).prefault({}),
+}).superRefine((value, ctx) => {
+  for (const key of ["baseUrl", "oauthTokenUrl"] as const) {
+    const url = new URL(value[key]);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash)
+      ctx.addIssue({ code: "custom", path: [key], message: "use an HTTP(S) URL without credentials, query, or fragment" });
+  }
+}).prefault({});
+export type ClaudeProviderConfig = z.infer<typeof ClaudeProviderSchema>;
+
+/** Native Codex ingress, with opt-in Claude routing. */
+const CodexIngressSchema = z.strictObject({
+  enabled: z.boolean().default(false),
+  subscriptionBaseUrl: z.url().refine(requireHttpsOrLoopback, { message: HTTPS_REQUIRED_MESSAGE })
+    .default("https://chatgpt.com/backend-api/codex"),
+  apiBaseUrl: z.url().refine(requireHttpsOrLoopback, { message: HTTPS_REQUIRED_MESSAGE })
+    .default("https://api.openai.com/v1"),
+  connectTimeoutMs: z.number().int().positive().default(10_000),
+  maxUpstreamSockets: z.number().int().positive().default(256),
+  allowCustomUpstream: z.boolean().default(false),
+  claude: ClaudeProviderSchema,
+}).superRefine((value, ctx) => {
+  for (const key of ["subscriptionBaseUrl", "apiBaseUrl"] as const) {
+    const url = new URL(value[key]);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+      ctx.addIssue({ code: "custom", path: [key], message: "use an HTTP(S) base URL without credentials, query, or fragment" });
+    }
+  }
+}).prefault({});
+
+export type CodexIngressConfig = z.infer<typeof CodexIngressSchema>;
+
 const FileConfigSchema = z.strictObject({
   port: z.number().int().min(1).max(65535).default(DEFAULT_PORT),
   logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
   anthropic: AnthropicSchema,
   providers: ProvidersSchema,
   limits: LimitsSchema,
+  codexIngress: CodexIngressSchema,
 });
 
 /** Raw on-disk config shape — what FileConfigSchema.safeParse() produces. */
@@ -370,6 +418,7 @@ export type ProviderConfigs = { readonly [K in ProviderId]: ProviderConfigShape[
 export interface Config {
   readonly port: number;
   readonly logLevel: LogLevel;
+  readonly codexIngress: CodexIngressConfig;
   /**
    * The privileged default leg, not a peer provider: it has no model list, no auth
    * config of its own (the client's credential is forwarded verbatim, applies ADR-002),
@@ -711,6 +760,7 @@ const PROVIDER_RESOLVERS: {
 export const resolveConfig = (file: FileConfig): Config => ({
   port: file.port,
   logLevel: file.logLevel,
+  codexIngress: file.codexIngress,
   anthropic: {
     baseUrl: file.anthropic.baseUrl,
     connectTimeoutMs: file.anthropic.connectTimeoutMs,
@@ -737,6 +787,18 @@ export interface LoadConfigOptions {
   readonly readFile?: (path: string) => string;
   /** Injectable environment variable map. Defaults to `process.env`. Used by tests. */
   readonly env?: Record<string, string | undefined>;
+  readonly globalConfigPath?: string | false;
+}
+
+export const userConfigPath = (env: Record<string, string | undefined> = process.env): string =>
+  join(env["XDG_CONFIG_HOME"] ?? join(homedir(), ".config"), "subswitch", "config.json");
+
+/** Own properties only; arrays and scalars replace, nested configuration objects merge. */
+export function mergeConfigObjects(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries([...new Set([...Object.keys(base), ...Object.keys(overlay)])].map(key => {
+    const value = Object.hasOwn(overlay, key) ? overlay[key] : base[key];
+    return [key, Object.hasOwn(overlay, key) && isPlainObject(base[key]) && isPlainObject(value) ? mergeConfigObjects(base[key], value) : value];
+  }));
 }
 
 export interface LoadConfigResult {
@@ -830,6 +892,21 @@ export const loadConfig = (options: LoadConfigOptions = {}): Result<LoadConfigRe
     }
   }
 
+  let loadedGlobal: string | undefined;
+  if (!isExplicit && options.globalConfigPath !== false) {
+    const globalPath = options.globalConfigPath ?? userConfigPath(env);
+    if (options.globalConfigPath !== undefined || existsSync(globalPath)) {
+      try {
+        const global = JSON.parse(readFile(globalPath));
+        if (!isPlainObject(global) || !isPlainObject(raw)) throw new Error();
+        raw = mergeConfigObjects(global, raw); loadedGlobal = globalPath;
+      } catch (cause) {
+        if (!(cause instanceof Error && (cause as NodeJS.ErrnoException).code === "ENOENT"))
+          return err({ kind: "translate", message: `cannot read valid user configuration at ${globalPath}` });
+      }
+    }
+  }
+
   // Step 3: reject the pre-`providers.*` layout before parsing. Zod strips unknown
   // keys, so a legacy config would otherwise parse clean and silently run on defaults.
   const legacy = detectLegacyConfigKeys(raw);
@@ -868,8 +945,8 @@ export const loadConfig = (options: LoadConfigOptions = {}): Result<LoadConfigRe
 
   return ok({
     config: resolveConfig(parsed.data),
-    configPath: resolvedPath,
-    fileFound,
+    configPath: !fileFound && loadedGlobal ? loadedGlobal : resolvedPath,
+    fileFound: fileFound || loadedGlobal !== undefined,
     configuredProviders: detectConfiguredProviders(raw),
   });
 };
