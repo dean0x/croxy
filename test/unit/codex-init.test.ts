@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { planCodexEndpoint, planNativeSetup } from "../../src/codex-init.js";
 import { loadConfig, mergeConfigObjects } from "../../src/config.js";
 import type { InitFsDeps } from "../../src/init.js";
+import { resolve } from "node:path";
 
 describe("Codex setup parity", () => {
   it("changes only the root endpoint value, preserving native settings and comments", () => {
@@ -40,6 +41,15 @@ describe("Codex setup parity", () => {
     assert.equal(plans.filter(plan => plan.path === "/project/subswitch.config.json").length, 1);
     assert.equal(JSON.parse(plans[0]!.content).codexIngress.claude.enabled, true);
     assert.equal(plans.at(-1)?.path, "/project/.claude/settings.local.json");
+  });
+  it("deduplicates relative and absolute references to the same configuration", async () => {
+    const fs: InitFsDeps = { readFile: async path => path === "/native/config.toml" ? 'openai_base_url = "https://trusted.example/v1"' : null,
+      exists: () => false, writeFile: async () => assert.fail() };
+    const plans = await planNativeSetup({ client: "both", port: 4141, settingsTarget: "local" },
+      { codexConfig: "/native/config.toml", subswitchConfig: "./subswitch.config.json", project: process.cwd() }, fs);
+    const configWrites = plans.filter(plan => resolve(plan.path) === resolve("subswitch.config.json"));
+    assert.equal(configWrites.length, 1);
+    assert.equal(JSON.parse(configWrites[0]!.content).codexIngress.subscriptionBaseUrl, "https://trusted.example/v1");
   });
 });
 

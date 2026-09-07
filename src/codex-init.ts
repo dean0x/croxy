@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parseTOML, getStaticTOMLValue } from "toml-eslint-parser";
 import * as zlib from "node:zlib";
 import { userConfigPath, expandHome, loadConfig, isLoopbackHost } from "./config.js";
@@ -70,9 +70,10 @@ export async function planNativeSetup(options: {
   let forwardSettings: SetupWrite | undefined;
   if (options.client === "both") {
     const projectConfigPath = join(paths.project, "subswitch.config.json");
-    const projectConfig = planConfigWrite(projectConfigPath === paths.subswitchConfig ? configContent : await fs.readFile(projectConfigPath), options.port, paths.project);
+    const sameConfig = resolve(projectConfigPath) === resolve(paths.subswitchConfig);
+    const projectConfig = planConfigWrite(sameConfig ? configContent : await fs.readFile(projectConfigPath), options.port, paths.project);
     if (!projectConfig.ok) throw new Error(projectConfig.error.message);
-    if (projectConfigPath !== paths.subswitchConfig) {
+    if (!sameConfig) {
       const project = object(JSON.parse(projectConfig.value.content))!;
       const projectIngress = object(project["codexIngress"]) ?? {};
       const content = JSON.stringify({ ...project, codexIngress: { ...projectIngress, enabled: true,

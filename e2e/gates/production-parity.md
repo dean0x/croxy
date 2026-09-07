@@ -78,7 +78,7 @@ subscription/extra-usage quota was charged.
 
 ## Automated and packaging verification
 
-Typechecking and all **824 tests** passed. The installed-tarball smoke check
+Typechecking and all **825 tests** passed. The installed-tarball smoke check
 validated both the unchanged forward setup and the new `init --client both`,
 `models --client codex --json`, and reverse-enabled server health. The existing
 SSE benchmark passed all three stream shapes within its unchanged linearity bound.
