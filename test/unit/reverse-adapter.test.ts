@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { reverseRequest, reverseResponse, reverseEvents, ReverseContractError } from "../../e2e/gates/reverse-adapter.js";
-import { ReverseState, replayIdentity } from "../../e2e/gates/reverse-state.js";
+import { reverseRequest, reverseResponse, reverseEvents, ReverseContractError } from "../../src/claude-adapter.js";
+import { ReverseState, replayIdentity } from "../../src/claude-state.js";
 
 const code = { type: "custom", name: "exec", description: "Execute JavaScript with the native tools object.", format: { type: "text" } };
 const tool = { type: "function", name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } };

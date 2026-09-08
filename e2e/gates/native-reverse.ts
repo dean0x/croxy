@@ -18,6 +18,8 @@ import { object } from "./probe.js";
 import { reverseRequest, reverseResponse, reverseEvents, ReverseContractError, type Item } from "./reverse-adapter.js";
 import { ReverseState } from "./reverse-state.js";
 
+class ExperimentError extends Error { constructor(readonly code: string) { super(code); } }
+
 const PARENT = "gpt-6-astra", CHILD = "claude-sonnet-5", MAX_BYTES = 4 * 1024 * 1024;
 const TASK = "Read check.txt using the native code tool functions.exec and tools.exec_command. Return the file's exact content. You must execute the tool before answering.";
 const textOutput = (text: string): Item => ({ type: "message", id: `msg_${randomUUID()}`, role: "assistant", phase: "final_answer", status: "completed",
@@ -50,12 +52,12 @@ export async function runNativeReverse(options: { liveParent?: boolean; http?: b
         signal: AbortSignal.any([abort.signal, AbortSignal.timeout(30000)]) });
       stats.upstreamStatuses.push({ provider, status: response.status });
       const reader = response.body?.getReader();
-      if (!reader) throw new ReverseContractError("missing_upstream_body");
+      if (!reader) throw new ExperimentError("missing_upstream_body");
       const chunks: Buffer[] = []; let bytes = 0;
       try {
         while (true) {
           const { done, value } = await reader.read(); if (done) break;
-          bytes += value.byteLength; if (bytes > MAX_BYTES) throw new ReverseContractError("upstream_body_limit"); chunks.push(Buffer.from(value));
+          bytes += value.byteLength; if (bytes > MAX_BYTES) throw new ExperimentError("upstream_body_limit"); chunks.push(Buffer.from(value));
         }
       } finally { await reader.cancel(); }
       if (!response.ok) {
@@ -65,16 +67,16 @@ export async function runNativeReverse(options: { liveParent?: boolean; http?: b
           if (typeof message === "string") detail = ["thinking", "signature", "tool_use", "tool_result", "system", "extra usage", "max_tokens", "beta"]
             .filter(word => message.toLowerCase().includes(word)).map(word => word.replace(" ", "_")).join("_");
         } catch { /* Closed diagnostic categories only. */ }
-        throw new ReverseContractError(`${provider}_http_${response.status}${detail ? `_${detail}` : ""}`);
+        throw new ExperimentError(`${provider}_http_${response.status}${detail ? `_${detail}` : ""}`);
       }
       return Buffer.concat(chunks);
     };
     const exchange = async (body: Item): Promise<Item[]> => {
-      if (stats.parentRequests + stats.childRequests + stats.warmups >= 24) throw new ReverseContractError("experiment_request_limit");
+      if (stats.parentRequests + stats.childRequests + stats.warmups >= 24) throw new ExperimentError("experiment_request_limit");
       const previous = typeof body["previous_response_id"] === "string" ? history.get(body["previous_response_id"]) : undefined;
-      if (body["previous_response_id"] !== undefined && !previous) throw new ReverseContractError("missing_continuation_state");
+      if (body["previous_response_id"] !== undefined && !previous) throw new ExperimentError("missing_continuation_state");
       const model = typeof body["model"] === "string" ? body["model"] : previous?.model;
-      if (model !== CHILD && model !== PARENT) throw new ReverseContractError("unexpected_model");
+      if (model !== CHILD && model !== PARENT) throw new ExperimentError("unexpected_model");
       const input = [...previous?.input ?? [], ...(Array.isArray(body["input"]) ? body["input"] as Item[] : [])];
       const tools = body["tools"] ?? previous?.tools;
       let id = `resp_reverse_${randomUUID()}`;
@@ -92,7 +94,7 @@ export async function runNativeReverse(options: { liveParent?: boolean; http?: b
           ...claudeHeaders, "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
         }, request.body);
         const response = object(JSON.parse(raw.toString("utf8")));
-        if (!response) throw new ReverseContractError("invalid_claude_response");
+        if (!response) throw new ExperimentError("invalid_claude_response");
         output = reverseResponse(response, request, state);
         stats.toolRequested ||= output.some(entry => ["function_call", "custom_tool_call"].includes(String(entry["type"])) && entry["namespace"] === "functions");
         stats.childAnswered ||= output.some(entry => entry["type"] === "message" && JSON.stringify(entry["content"]).includes(marker));
@@ -111,17 +113,17 @@ export async function runNativeReverse(options: { liveParent?: boolean; http?: b
           for await (const event of parser) {
             if (!event.data || event.data === "[DONE]") continue;
             const frame = namespaceEvent(JSON.parse(event.data));
-            if (["error", "response.failed", "response.incomplete"].includes(String(frame["type"]))) throw new ReverseContractError("openai_terminal_failure");
+            if (["error", "response.failed", "response.incomplete"].includes(String(frame["type"]))) throw new ExperimentError("openai_terminal_failure");
             frames.push(frame);
             if (frame["type"] === "response.output_item.done") output.push(object(frame["item"]) ?? {});
             if (frame["type"] === "response.completed") {
               const response = object(frame["response"]);
-              if (response?.["status"] !== "completed" || typeof response["id"] !== "string") throw new ReverseContractError("invalid_openai_terminal");
+              if (response?.["status"] !== "completed" || typeof response["id"] !== "string") throw new ExperimentError("invalid_openai_terminal");
               id = response["id"]; completed = true;
               if (!output.length && Array.isArray(response["output"])) output = response["output"] as Item[];
             }
           }
-          if (!completed) throw new ReverseContractError("missing_openai_terminal");
+          if (!completed) throw new ExperimentError("missing_openai_terminal");
         } else {
           if (stats.errors.length) output = [textOutput("The reverse experiment failed.")];
           else if (!spawned) { spawned = true; output = [functionOutput("spawn_agent", { task_name: "sonnet", model: CHILD, fork_turns: "none", message: TASK })]; }
@@ -136,7 +138,7 @@ export async function runNativeReverse(options: { liveParent?: boolean; http?: b
       return frames;
     };
     const errorFrame = (error: unknown) => {
-      const code = error instanceof ReverseContractError ? error.code : "experiment_error";
+      const code = (error instanceof ExperimentError || error instanceof ReverseContractError) ? error.code : "experiment_error";
       stats.errors.push(code);
       process.stderr.write(JSON.stringify({ stage: "reverse_contract", code }) + "\n");
       return { type: "error", code, message: "The isolated reverse contract failed." };
@@ -148,14 +150,14 @@ export async function runNativeReverse(options: { liveParent?: boolean; http?: b
         if (req.url?.includes("/models")) { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ models })); return; }
         if (req.method !== "POST" || !req.url?.includes("/responses")) { res.writeHead(404); res.end(); return; }
         const chunks: Buffer[] = []; let bytes = 0;
-        for await (const chunk of req) { bytes += chunk.length; if (bytes > MAX_BYTES) throw new ReverseContractError("incoming_body_limit"); chunks.push(chunk); }
+        for await (const chunk of req) { bytes += chunk.length; if (bytes > MAX_BYTES) throw new ExperimentError("incoming_body_limit"); chunks.push(chunk); }
         let raw: Buffer = Buffer.concat(chunks);
         const decoders: Record<string, (body: Buffer, options: { maxOutputLength: number }) => Buffer> = {
           gzip: gunzipSync, br: brotliDecompressSync, deflate: inflateSync, zstd: zstdDecompressSync,
         };
         const encoding = req.headers["content-encoding"];
         if (typeof encoding === "string" && encoding !== "identity") {
-          const decode = decoders[encoding]; if (!decode) throw new ReverseContractError("unsupported_encoding");
+          const decode = decoders[encoding]; if (!decode) throw new ExperimentError("unsupported_encoding");
           raw = decode(raw, { maxOutputLength: MAX_BYTES });
         }
         stats.httpRequests++;
@@ -187,29 +189,29 @@ export async function runNativeReverse(options: { liveParent?: boolean; http?: b
       const env = isolatedNativeEnv({ CODEX_HOME: codexDir, ...(options.nativeSubscription ? {} : { OPENAI_API_KEY: "fabricated-local-client-key" }) });
       const version = await nativeProcess("codex", ["--version"], { cwd: work, env, timeoutMs: 10000 });
       const clientVersion = version.stdout.match(/codex-cli (\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?)/)?.[1];
-      if (version.failure || version.code !== 0 || !clientVersion) throw new ReverseContractError("codex_version_unavailable");
+      if (version.failure || version.code !== 0 || !clientVersion) throw new ExperimentError("codex_version_unavailable");
       const fixture = JSON.parse(await readFile(new URL("../../test/fixtures/native/codex-0.153.3-model.json", import.meta.url), "utf8"));
       models = [PARENT, CHILD].map(slug => ({ ...fixture, slug, display_name: slug, multi_agent_version: "v2",
         model_messages: null, base_instructions: "You are an agent running inside native Codex. Follow the supplied tool definitions and user task.", supported_in_api: true }));
-      if (!(await listenServer(upstream, 0, "127.0.0.1")).ok) throw new ReverseContractError("listen_failed");
-      const address = upstream.address(); if (!address || typeof address === "string") throw new ReverseContractError("listen_failed");
+      if (!(await listenServer(upstream, 0, "127.0.0.1")).ok) throw new ExperimentError("listen_failed");
+      const address = upstream.address(); if (!address || typeof address === "string") throw new ExperimentError("listen_failed");
       const base = `http://127.0.0.1:${address.port}`;
       const config = loadConfig({ env: {}, configPath: join(temp, "inline.json"), readFile: () => JSON.stringify({
         anthropic: { baseUrl: base }, providers: { codex: { authFile: join(temp, "unused-auth.json") } },
         codexIngress: { enabled: true, subscriptionBaseUrl: `${base}/backend-api/codex`, apiBaseUrl: `${base}/v1` },
       }) });
-      if (!config.ok) throw new ReverseContractError("config_failed");
+      if (!config.ok) throw new ExperimentError("config_failed");
       const deps = buildDeps(config.value.config, { log: () => undefined });
-      if (!deps.ok) throw new ReverseContractError("proxy_failed");
+      if (!deps.ok) throw new ExperimentError("proxy_failed");
       proxy = createProxyServer(deps.value);
-      if (!(await listenServer(proxy, 0, "127.0.0.1")).ok) throw new ReverseContractError("proxy_listen_failed");
-      const proxyAddress = proxy.address(); if (!proxyAddress || typeof proxyAddress === "string") throw new ReverseContractError("proxy_listen_failed");
+      if (!(await listenServer(proxy, 0, "127.0.0.1")).ok) throw new ExperimentError("proxy_listen_failed");
+      const proxyAddress = proxy.address(); if (!proxyAddress || typeof proxyAddress === "string") throw new ExperimentError("proxy_listen_failed");
       let localAuth: Item = { OPENAI_API_KEY: "fabricated-local-client-key" };
       if (options.nativeSubscription) {
         // A restricted, temporary access-only copy. The live shared refresh token is never copied.
         const source = object(JSON.parse(await readFile(join(process.env["CODEX_HOME"] ?? join(homedir(), ".codex"), "auth.json"), "utf8")));
         const tokens = object(source?.["tokens"]);
-        if (!tokens || typeof tokens["access_token"] !== "string") throw new ReverseContractError("native_subscription_missing");
+        if (!tokens || typeof tokens["access_token"] !== "string") throw new ExperimentError("native_subscription_missing");
         localAuth = { auth_mode: "chatgpt", tokens: { ...tokens, refresh_token: "" } };
       }
       await writeFile(join(codexDir, "auth.json"), JSON.stringify(localAuth), { mode: 0o600 });

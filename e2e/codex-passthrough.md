@@ -54,7 +54,7 @@ headers and duplicate end-to-end response headers otherwise retain their values.
 HTTP errors on a rejected WebSocket upgrade retain upstream status and body.
 Redirects are relayed to the client; the proxy does not follow them with credentials.
 
-`allowCustomUpstream` must be explicitly true for non-default remote hosts or
+`allowInsecureBaseUrl` must be explicitly true for non-default remote hosts or
 ports. HTTPS is required for remote destinations even with that option. Loopback
 HTTP is allowed for local fake upstreams. URLs containing embedded credentials,
 queries, or fragments are rejected. Configuration does not contain API keys.

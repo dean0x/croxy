@@ -35,7 +35,7 @@
   "author": "dean0x",
   "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": "^22.15.0 || >=24"
   },
   "scripts": {
     "serve": "tsx src/cli.ts serve",
@@ -51,7 +51,8 @@
     "build": "tsc -p tsconfig.build.json",
     "prepack": "npm run build",
     "prepublishOnly": "npm run check",
-    "probe:native-reverse": "tsx e2e/gates/native-production.ts"
+    "probe:native-reverse": "tsx e2e/gates/native-reverse.ts",
+    "probe:native-production": "tsx e2e/gates/native-production.ts"
   },
   "dependencies": {
     "@clack/prompts": "^1.7.0",

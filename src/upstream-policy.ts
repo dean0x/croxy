@@ -1,0 +1,30 @@
+import { isLoopbackHost } from "./config.js";
+import type { Logger } from "./logger.js";
+import { ok, err, type Result } from "./result.js";
+
+export const vetCredentialUrl = (options: {
+  url: string;
+  path: string;
+  expectedHost: string;
+  optInKey: string;
+  allowOverride: boolean;
+  logger: Logger;
+  refreshToken?: boolean;
+  events: { insecureBaseUrlScheme: string; baseUrlHostRejected: string; baseUrlOverrideDetected: string };
+}): Result<void, string> => {
+  const { path, logger, events } = options;
+  const url = new URL(options.url);
+  if (isLoopbackHost(url.hostname)) return ok(undefined);
+  if (url.protocol !== "https:") logger.log("warn", events.insecureBaseUrlScheme);
+  if (url.hostname === options.expectedHost && (!url.port || url.port === "443")) return ok(undefined);
+  if (!options.allowOverride) {
+    logger.log("error", events.baseUrlHostRejected, { path });
+    return err(
+      `${path} points at '${url.host}' (expected '${options.expectedHost}'). ` +
+        `${options.refreshToken ? "Your long-lived refresh token" : "Credentials"} would be sent to an untrusted host. ` +
+        `Set "${options.optInKey}": true in subswitch.config.json to opt in.`,
+    );
+  }
+  logger.log("warn", events.baseUrlOverrideDetected);
+  return ok(undefined);
+};

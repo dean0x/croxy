@@ -4,7 +4,7 @@ import { createRawHttpForwarder, type PassthroughOptions as RawOptions, type For
 
 export type { ForwardedBody } from "./raw-http-passthrough.js";
 export type PassthroughOptions = Omit<RawOptions, "errorBody" | "logPath" | "events">;
-export type AnthropicForwarder = (req: IncomingMessage, res: ServerResponse, body?: ForwardedBody) => void;
+export type AnthropicForwarder = ((req: IncomingMessage, res: ServerResponse, body?: ForwardedBody) => void) & { close?(): void };
 
 /** Existing Claude-facing transport, with its original errors and connect-only timeout. */
 export const createAnthropicForwarder = (options: PassthroughOptions): AnthropicForwarder =>

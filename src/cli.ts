@@ -47,8 +47,8 @@ Usage: subswitch [command] [flags]
 
 Commands:
   serve     Start the proxy (default command)
-  doctor    Check config, codex auth, and network reachability
-  init      Interactive setup — writes config + wires Claude Code
+  doctor    Check config, subscription auth, and network reachability
+  init      Interactive setup — wires the selected client(s)
   models    Show effective alias table (registry × aliases)
             --json   Output model registry as JSON (no color, no TTY check)
 
@@ -70,7 +70,7 @@ Flags (init):
 
 Flags (init, doctor, models):
       --client <client>     "claude-code", "codex", or "both"
-                            init/models default to claude-code; doctor checks configured paths
+                            init/models default to claude-code; doctor defaults to both
 
 Examples:
   subswitch serve                      # start proxy on port ${DEFAULT_PORT}
@@ -337,7 +337,7 @@ const doctor = async (result: LoadConfigResult, client: Client): Promise<void> =
 
   process.exitCode = client === "codex" ? 0 : await runDoctor(
     result.config,
-    result.configPath,
+    result.configPaths.length ? result.configPaths.join(" + ") : result.configPath,
     result.fileFound,
     {
       write: out,
@@ -348,12 +348,12 @@ const doctor = async (result: LoadConfigResult, client: Client): Promise<void> =
       listAgentFiles: makeLiveListAgentFiles(),
       readTextFile: makeLiveReadTextFile(),
     },
-    // Only providers the user wrote into the config file can fail the exit code. (avoids PF-006)
+    // Only providers explicitly present in the loaded configuration sources can fail the exit code. (avoids PF-006)
     result.configuredProviders,
   );
   if (client === "codex" || (client === "both" && result.config.codexIngress.claude.enabled)) {
     const { runCodexDoctor } = await import("./codex-doctor.js");
-    process.exitCode = Math.max(Number(process.exitCode ?? 0), await runCodexDoctor(result.config, out));
+    process.exitCode = Math.max(Number(process.exitCode ?? 0), await runCodexDoctor(result.config, out, { color }));
   }
 };
 
@@ -396,7 +396,12 @@ const modelsJson = (result: LoadConfigResult, client: Client): void => {
   const reverse = { kind: "models", schemaVersion: 2, client: "codex", subswitchVersion: SUBSWITCH_VERSION,
     fallbackProvider: "codex", enabled: config.codexIngress.enabled && config.codexIngress.claude.enabled,
     models: claudeModelRows(config.codexIngress.claude.aliases) };
-  out(JSON.stringify(client === "codex" ? reverse : client === "both" ? { kind: "models", schemaVersion: 2, clients: { "claude-code": payload, codex: reverse } } : payload));
+  if (client === "codex") { out(JSON.stringify(reverse)); return; }
+  if (client === "both") {
+    out(JSON.stringify({ kind: "models", schemaVersion: 2, client: "both", clients: { "claude-code": payload, codex: reverse } }));
+    return;
+  }
+  out(JSON.stringify(payload));
 };
 
 const models = (config: Config, client: Client): void => {
@@ -454,10 +459,11 @@ const runInit = async (command: Extract<CliCommand, { kind: "init" }>): Promise<
       if (prompts.isCancel(selected)) { prompts.cancel("Setup cancelled"); process.exitCode = 1; return; }
       port = String(selected);
     }
-    const { runNativeInit } = await import("./codex-init.js");
-    await runNativeInit({ client: command.client, dryRun: command.dryRun,
+    const { runCodexInit } = await import("./codex-init.js");
+    const result = await runCodexInit({ client: command.client, dryRun: command.dryRun,
       ...(port === undefined ? {} : { port }), ...(command.flags.settingsTarget === undefined ? {} : { settingsTarget: command.flags.settingsTarget }),
     }, fsDeps, env, projectDir, out);
+    if (!result.ok) fail(result.error.message);
     return;
   }
 
@@ -471,7 +477,7 @@ const runInit = async (command: Extract<CliCommand, { kind: "init" }>): Promise<
   const decision = resolveInitDispatch(
     process.stdin.isTTY === true,
     process.stdout.isTTY === true,
-    "CI" in process.env,
+    "CI" in env,
     command.yes,
   );
 

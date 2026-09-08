@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -6,7 +6,7 @@ import { type Result, ok, err } from "./result.js";
 import type { ProxyError } from "./errors.js";
 import type { LogLevel } from "./logger.js";
 import { isReservedAnthropicName, PROVIDER_IDS, type ProviderId, type AliasesByProvider } from "./models.js";
-import { isOpenaiModelName } from "./claude-models.js";
+import { validClaudeAlias } from "./claude-models.js";
 
 export const DEFAULT_PORT = 4141 as const;
 
@@ -311,14 +311,14 @@ const ClaudeProviderSchema = z.strictObject({
   configDir: z.string().min(1).optional(),
   authFile: z.string().min(1).optional(),
   aliases: z.record(z.string().min(1).max(200), z.string().min(1).max(200)).refine(value =>
-    Object.entries(value).every(([key, target]) => !isOpenaiModelName(key) && !isOpenaiModelName(target) && target.startsWith("claude-")),
+    Object.entries(value).every(([key, target]) => validClaudeAlias(key, target)),
   { message: "Claude aliases must target claude-* IDs and must not claim OpenAI model names" }).default({}),
-  allowCustomUpstream: z.boolean().default(false),
+  allowInsecureBaseUrl: z.boolean().default(false),
   requestTimeoutMs: z.number().int().positive().default(600_000),
   streamIdleTimeoutMs: z.number().int().positive().default(300_000),
   maxSseEventBytes: z.number().int().positive().default(4 * 1024 * 1024),
   maxAggregateBytes: z.number().int().positive().default(64 * 1024 * 1024),
-  continuationCache: z.strictObject({ maxEntries: z.number().int().positive().default(4096), maxBytes: z.number().int().positive().default(64 * 1024 * 1024) }).prefault({}),
+  reasoningCache: z.strictObject({ maxEntries: z.number().int().positive().default(4096), maxBytes: z.number().int().positive().default(64 * 1024 * 1024) }).prefault({}),
 }).superRefine((value, ctx) => {
   for (const key of ["baseUrl", "oauthTokenUrl"] as const) {
     const url = new URL(value[key]);
@@ -337,7 +337,7 @@ const CodexIngressSchema = z.strictObject({
     .default("https://api.openai.com/v1"),
   connectTimeoutMs: z.number().int().positive().default(10_000),
   maxUpstreamSockets: z.number().int().positive().default(256),
-  allowCustomUpstream: z.boolean().default(false),
+  allowInsecureBaseUrl: z.boolean().default(false),
   claude: ClaudeProviderSchema,
 }).superRefine((value, ctx) => {
   for (const key of ["subscriptionBaseUrl", "apiBaseUrl"] as const) {
@@ -788,10 +788,12 @@ export interface LoadConfigOptions {
   /** Injectable environment variable map. Defaults to `process.env`. Used by tests. */
   readonly env?: Record<string, string | undefined>;
   readonly globalConfigPath?: string | false;
+  readonly homeDir?: string;
+  readonly cwd?: string;
 }
 
-export const userConfigPath = (env: Record<string, string | undefined> = process.env): string =>
-  join(env["XDG_CONFIG_HOME"] ?? join(homedir(), ".config"), "subswitch", "config.json");
+export const userConfigPath = (env: Record<string, string | undefined> = process.env, homeDir = env["HOME"] ?? homedir()): string =>
+  join(env["XDG_CONFIG_HOME"] ?? join(homeDir, ".config"), "subswitch", "config.json");
 
 /** Own properties only; arrays and scalars replace, nested configuration objects merge. */
 export function mergeConfigObjects(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
@@ -802,6 +804,8 @@ export function mergeConfigObjects(base: Record<string, unknown>, overlay: Recor
 }
 
 export interface LoadConfigResult {
+  /** Loaded source paths in precedence order (user defaults, then project). */
+  readonly configPaths: readonly string[];
   readonly config: Config;
   readonly configPath: string;
   readonly fileFound: boolean;
@@ -838,9 +842,10 @@ const detectConfiguredProviders = (raw: unknown): ReadonlySet<ProviderId> => {
  * Path precedence (highest to lowest):
  *   1. explicit `configPath` option
  *   2. `SUBSWITCH_CONFIG` env var (tilde-expanded)
- *   3. implicit `<cwd>/subswitch.config.json`
+ *   3. implicit user config merged under `<cwd>/subswitch.config.json` (project fields win)
  *
- * Only the implicit cwd default silently falls back to pure defaults on ENOENT.
+ * Only implicit user/project files silently fall back to defaults on ENOENT.
+ * Explicit config selection bypasses the user/project merge.
  * An explicitly-requested path (option or SUBSWITCH_CONFIG) that is missing is an error.
  */
 export const loadConfig = (options: LoadConfigOptions = {}): Result<LoadConfigResult, ProxyError> => {
@@ -857,7 +862,7 @@ export const loadConfig = (options: LoadConfigOptions = {}): Result<LoadConfigRe
     resolvedPath = expandHome(env["SUBSWITCH_CONFIG"]);
     isExplicit = true;
   } else {
-    resolvedPath = join(process.cwd(), "subswitch.config.json");
+    resolvedPath = join(options.cwd ?? process.cwd(), "subswitch.config.json");
     isExplicit = false;
   }
 
@@ -892,29 +897,38 @@ export const loadConfig = (options: LoadConfigOptions = {}): Result<LoadConfigRe
     }
   }
 
+  const sources: { path: string; raw: unknown }[] = fileFound ? [{ path: resolvedPath, raw }] : [];
   let loadedGlobal: string | undefined;
   if (!isExplicit && options.globalConfigPath !== false) {
-    const globalPath = options.globalConfigPath ?? userConfigPath(env);
-    if (options.globalConfigPath !== undefined || existsSync(globalPath)) {
-      try {
-        const global = JSON.parse(readFile(globalPath));
-        if (!isPlainObject(global) || !isPlainObject(raw)) throw new Error();
-        raw = mergeConfigObjects(global, raw); loadedGlobal = globalPath;
-      } catch (cause) {
+    const globalPath = options.globalConfigPath ?? userConfigPath(env, options.homeDir);
+    if (globalPath !== resolvedPath) {
+      let globalText: string | undefined;
+      try { globalText = readFile(globalPath); }
+      catch (cause) {
         if (!(cause instanceof Error && (cause as NodeJS.ErrnoException).code === "ENOENT"))
-          return err({ kind: "translate", message: `cannot read valid user configuration at ${globalPath}` });
+          return err({ kind: "translate", message: `cannot read user configuration at ${globalPath}` });
+      }
+      if (globalText !== undefined) {
+        let global: unknown;
+        try { global = JSON.parse(globalText); }
+        catch { return err({ kind: "translate", message: `malformed JSON in ${globalPath} — fix or delete the file` }); }
+        if (!isPlainObject(global)) return err({ kind: "translate", message: `configuration at ${globalPath} must be a JSON object` });
+        sources.unshift({ path: globalPath, raw: global });
+        if (isPlainObject(raw)) raw = mergeConfigObjects(global, raw);
+        loadedGlobal = globalPath;
       }
     }
   }
 
+  for (const source of sources) {
   // Step 3: reject the pre-`providers.*` layout before parsing. Zod strips unknown
   // keys, so a legacy config would otherwise parse clean and silently run on defaults.
-  const legacy = detectLegacyConfigKeys(raw);
+  const legacy = detectLegacyConfigKeys(source.raw);
   if (legacy.length > 0) {
     return err({
       kind: "translate",
       message:
-        `unsupported config keys in ${resolvedPath} — ` +
+        `unsupported config keys in ${source.path} — ` +
         legacy.map(renderLegacyKeyEntry).join("; ") +
         `. Edit the file to match subswitch.config.example.json, or delete it to run on defaults.`,
     });
@@ -922,16 +936,18 @@ export const loadConfig = (options: LoadConfigOptions = {}): Result<LoadConfigRe
 
   // Step 3b: reject provider blocks written under an unknown id. Same reason as
   // step 3 — z.object strips them, so the block would silently do nothing.
-  const unknownProviders = detectUnknownProviderKeys(raw);
+  const unknownProviders = detectUnknownProviderKeys(source.raw);
   if (unknownProviders.length > 0) {
     return err({
       kind: "translate",
       message:
-        `unknown provider block(s) in ${resolvedPath}: ` +
+        `unknown provider block(s) in ${source.path}: ` +
         unknownProviders.map((key) => `\`providers.${key}\``).join(", ") +
         `. Known providers: ${PROVIDER_IDS.join(", ")}. ` +
         `An unrecognised provider block is ignored entirely, so leaving it in place would silently change nothing.`,
     });
+  }
+
   }
 
   // Step 4: validate against FileConfigSchema and resolve to runtime Config.
@@ -939,12 +955,13 @@ export const loadConfig = (options: LoadConfigOptions = {}): Result<LoadConfigRe
   if (!parsed.success) {
     return err({
       kind: "translate",
-      message: `invalid config: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`,
+      message: `invalid config: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")} (sources: ${sources.map(source => source.path).join(" + ") || resolvedPath})`,
     });
   }
 
   return ok({
     config: resolveConfig(parsed.data),
+    configPaths: sources.map(source => source.path),
     configPath: !fileFound && loadedGlobal ? loadedGlobal : resolvedPath,
     fileFound: fileFound || loadedGlobal !== undefined,
     configuredProviders: detectConfiguredProviders(raw),

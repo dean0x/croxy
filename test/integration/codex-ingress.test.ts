@@ -66,6 +66,16 @@ describe("Codex namespace and raw HTTP ingress", () => {
     for (const path of ["/v1/messages", "/codex-other"]) assert.equal(codexIngressRoute(path).kind, "other");
   });
 
+  it("uses the originating error envelope for non-Codex upgrades", async () => {
+    const { proxy } = await setup((_req, res) => res.end());
+    const rejected = await rawUpgrade(proxy.url, { path: "/v1/messages", origin: "https://foreign.example" });
+    assert.match(rejected.bytes().toString(), /403/);
+    assert.match(rejected.bytes().toString(), /"type":"error","error":\{"type":"permission_error"/);
+    const missing = await rawUpgrade(proxy.url, { path: "/v1/messages" });
+    assert.match(missing.bytes().toString(), /404/);
+    assert.match(missing.bytes().toString(), /"type":"not_found_error"/);
+  });
+
   it("keeps disabled and unknown Codex paths away from Anthropic", async () => {
     const { proxy, anthropic, subscription, api } = await setup((_req, res) => res.end(), { enabled: false });
     for (const [path, status] of [["/codex/v1/responses", 503], ["/codex/unknown", 404]] as const) {
@@ -222,7 +232,7 @@ describe("Codex namespace and raw HTTP ingress", () => {
       const result = parse({ enabled: true, apiBaseUrl: url });
       assert.ok(result.ok);
       assert.equal(buildDeps(result.value.config).ok, false);
-      const explicit = parse({ enabled: true, apiBaseUrl: url, allowCustomUpstream: true });
+      const explicit = parse({ enabled: true, apiBaseUrl: url, allowInsecureBaseUrl: true });
       assert.ok(explicit.ok);
       const deps = buildDeps(explicit.value.config);
       assert.ok(deps.ok);

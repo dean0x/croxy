@@ -16,11 +16,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   user configuration fallback. Existing Claude Code setup remains the default.
 - Live native acceptance runners and shared parity follow-ups in issues #45–#48.
 
-### Compatibility
+### Changed
 
-- Reverse routing requires Node 22.15+ for native zstd requests and includes the
+- Supported Node versions are `^22.15.0 || >=24`, matching native zstd and runtime dependency requirements. Reverse routing includes the
   documented Claude identity preamble. Durable restart/compaction, setup undo and
   explicit API authentication for translated inference remain separate shared work.
+
+- User-level configuration now participates in every implicit config load, including
+  forward-only runs. Project fields override it; explicit config selection bypasses it.
+  Invalid user configuration can therefore prevent startup; diagnostics show its source.
+- Raw relay headers named by `Connection` are stripped on both legs in both directions.
+- Native Codex setup requires explicit trust for a custom upstream host before it writes files.
+
+### Fixed
+
+- Scope native credential substitution to exact Codex endpoints and redact synthesized
+  OpenAI errors at the JSON, SSE, and WebSocket render boundaries.
+- Use async decompression, one shared continuation/replay budget, bounded upgraded
+  sockets, and the shared raw HTTP transport with one credential refresh retry.
+- Classify translation, state, internal, and upstream failures explicitly; validate
+  malformed history/catalog values and bound recursive protocol traversal.
+- Document all ingress configuration keys, model JSON schemas, and ingress log routes.
 
 ## [0.4.0] - 2026-09-01
 

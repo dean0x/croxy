@@ -191,3 +191,9 @@ translated inference, and broader content/tool extensions are shared follow-ups
 [#45–#48](https://github.com/dean0x/subswitch/issues/45). These are not release claims.
 The upstream report drafts remain unsent. Source-only runners and fixtures are
 excluded from the installed package.
+
+### Native runner entrypoints
+
+`npm run probe:native-reverse` runs the experimental reverse harness in `native-reverse.ts`.
+`npm run probe:native-production` runs `native-production.ts`, the production gateway
+acceptance runner. These are live, credential-using gates and are separate from `npm test`.

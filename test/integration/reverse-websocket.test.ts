@@ -1,3 +1,5 @@
+import { claudeResolver } from "../../src/claude-models.js";
+import { ClaudeAuthManager, createClaudeCredentialStore } from "../../src/claude-auth.js";
 import http from "node:http";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -106,7 +108,10 @@ describe("production reverse WebSockets", () => {
     const requested = new Promise<void>(resolve => { started = resolve; });
     const credentials = new Promise<Result<ProviderCredential<"codex">, ProxyError>>(resolve => { release = resolve; });
     const auth = { refreshable: true, getCredentials: () => { started(); return credentials; }, forceRefresh: () => credentials };
-    const gateway = new CodexGateway(config.value.config, { log() {} }, undefined, undefined, auth);
+    const gateway = new CodexGateway({ config: config.value.config, logger: { log() {} }, parentAuth: auth, resolveClaude: claudeResolver(config.value.config.codexIngress.claude.aliases),
+      claudeAuth: new ClaudeAuthManager({ store: createClaudeCredentialStore(config.value.config.codexIngress.claude),
+        oauthTokenUrl: config.value.config.codexIngress.claude.oauthTokenUrl, logger: { log() {} } }),
+    });
     const server = http.createServer();
     server.on("upgrade", (req, socket, head) => gateway.upgrade(req, socket, head, "subscription", "/responses"));
     const local = await listen(server);

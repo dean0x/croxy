@@ -13,18 +13,18 @@
     "apiBaseUrl": "https://api.openai.com/v1",
     "connectTimeoutMs": 10000,
     "maxUpstreamSockets": 256,
-    "allowCustomUpstream": false,
+    "allowInsecureBaseUrl": false,
     "claude": {
       "enabled": false,
       "baseUrl": "https://api.anthropic.com",
       "oauthTokenUrl": "https://platform.claude.com/v1/oauth/token",
       "aliases": {},
-      "allowCustomUpstream": false,
+      "allowInsecureBaseUrl": false,
       "requestTimeoutMs": 600000,
       "streamIdleTimeoutMs": 300000,
       "maxSseEventBytes": 4194304,
       "maxAggregateBytes": 67108864,
-      "continuationCache": {
+      "reasoningCache": {
         "maxEntries": 4096,
         "maxBytes": 67108864
       }

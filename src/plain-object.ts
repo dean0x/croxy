@@ -7,3 +7,6 @@
  */
 export const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
+
+export type ObjectValue = Record<string, unknown>;
+export const object = (value: unknown): ObjectValue | undefined => isPlainObject(value) ? value : undefined;

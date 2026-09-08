@@ -52,11 +52,25 @@ describe("production reverse HTTP ingress", () => {
       for (const request of fixture.claude.requests) {
         assert.equal(request.headers.authorization, "Bearer claude-private-fixture"); assert.equal(request.headers["x-api-key"], undefined);
         assert.equal(JSON.parse(request.body.toString()).model, "claude-sonnet-5");
+        // MUTATION CHECK: deleting either identity field must fail this independent literal pin.
+        assert.equal(request.headers["anthropic-beta"], "claude-code-20250219,oauth-2025-04-20");
+        assert.equal(JSON.parse(request.body.toString()).system[0].text, "You are Claude Code, Anthropic's official CLI for Claude.");
       }
       const continuation = JSON.parse(fixture.claude.requests[1]!.body.toString());
       assert.match(JSON.stringify(continuation.messages), /signed-private-fixture/);
       assert.match(JSON.stringify(continuation.messages), /tool_result/);
       assert.ok(!JSON.stringify(fixture.logs).includes("claude-private-fixture")); assert.ok(!JSON.stringify(fixture.logs).includes("signed-private-fixture"));
+    } finally { await fixture.close(); }
+  });
+
+  it("rejects null translated history items as client errors without contacting either upstream", async () => {
+    const fixture = await setup((_req, res) => res.end());
+    try {
+      const response = await fetch(`${fixture.proxy.url}/codex/v1/responses`, {
+        method: "POST", body: JSON.stringify({ model: "sonnet", input: [null] }),
+      });
+      assert.equal(response.status, 400); assert.match(await response.text(), /invalid_input_item/);
+      assert.equal(fixture.claude.requests.length + fixture.openai.requests.length, 0);
     } finally { await fixture.close(); }
   });
 

@@ -1,3 +1,4 @@
+import { boundTcpConnect } from "./tcp-connect.js";
 import http from "node:http";
 import https from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -44,7 +45,8 @@ export const RESPONSE_STRIP = new Set([...HOP_BY_HOP, SYNTHESIZED_HEADER]);
 
 /**
  * Build a filtered flat [name, value, ...] array from a rawHeaders array,
- * skipping headers listed in `strip` case-insensitively while preserving the
+ * skipping headers listed in `strip` or named by any Connection header
+ * case-insensitively while preserving the
  * original casing, order, and duplicates of every non-stripped header.
  *
  * The `strip` parameter is REQUIRED so every call site must declare its direction:
@@ -66,7 +68,8 @@ export const filterRawHeaders = (rawHeaders: readonly string[], strip: ReadonlyS
   for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
     const name = rawHeaders[i]!;
     const value = rawHeaders[i + 1]!;
-    if (!strip.has(name.toLowerCase()) && !connectionFields.has(name.toLowerCase())) {
+    const lower = name.toLowerCase();
+    if (!strip.has(lower) && !connectionFields.has(lower)) {
       filtered.push(name, value);
     }
   }
@@ -92,8 +95,8 @@ export interface PassthroughOptions {
   readonly errorBody: (message: string) => string;
   readonly logPath: (req: IncomingMessage) => string;
   readonly events: {
-    readonly timeout: "anthropic_upstream_timeout" | "openai_upstream_timeout";
-    readonly error: "anthropic_upstream_error" | "openai_upstream_error";
+    readonly timeout: Parameters<Logger["log"]>[1];
+    readonly error: Parameters<Logger["log"]>[1];
   };
   readonly baseUrl: string;
   /**
@@ -139,8 +142,14 @@ export type ForwardedBody =
   | { readonly kind: "complete"; readonly bytes: Buffer }
   | { readonly kind: "prefix"; readonly bytes: Buffer };
 
+export interface ForwardHooks {
+  readonly onResponse?: ((response: IncomingMessage) => Promise<void>) | undefined;
+  readonly onUnauthorized?: (() => Promise<readonly string[]>) | undefined;
+  readonly onError?: ((error: unknown) => void) | undefined;
+}
+
 export interface RawHttpForwarder {
-  (req: IncomingMessage, res: ServerResponse, body?: ForwardedBody, requestPath?: string, rawHeaders?: readonly string[]): void;
+  (req: IncomingMessage, res: ServerResponse, body?: ForwardedBody, requestPath?: string, rawHeaders?: readonly string[], hooks?: ForwardHooks): void;
   close(): void;
 }
 
@@ -158,7 +167,10 @@ export const createRawHttpForwarder = (options: PassthroughOptions): RawHttpForw
   // Shared across calls so allocation is constant rather than per-request.
   const EMPTY_PREFIX: ForwardedBody = { kind: "prefix", bytes: Buffer.alloc(0) };
 
-  const forward = (req: IncomingMessage, res: ServerResponse, body?: ForwardedBody, requestPath?: string, rawHeaders?: readonly string[]): void => {
+  const requests = new Set<http.ClientRequest>();
+  let closed = false;
+  const forward = (req: IncomingMessage, res: ServerResponse, body?: ForwardedBody, requestPath?: string, rawHeaders?: readonly string[], hooks?: ForwardHooks): void => {
+    if (closed || res.destroyed) return;
     const path = `${basePath}${requestPath ?? req.url ?? "/"}` || "/";
     // Normalise: omitted means nothing has been read yet (prefix path, empty prefix).
     const consumed = body ?? EMPTY_PREFIX;
@@ -188,7 +200,7 @@ export const createRawHttpForwarder = (options: PassthroughOptions): RawHttpForw
     const upstream = client.request(
       {
         protocol: target.protocol,
-        hostname: target.hostname,
+        hostname: target.hostname.replace(/^\[|\]$/g, ""),
         ...(target.port !== "" ? { port: Number(target.port) } : {}),
         method: req.method ?? "GET",
         path,
@@ -200,7 +212,22 @@ export const createRawHttpForwarder = (options: PassthroughOptions): RawHttpForw
       },
       // Terminal outcome 1 (upstream response headers).
       (upstreamRes) => {
-        if (!settle()) return;
+        if (!settle()) { upstreamRes.destroy(); return; }
+        // Retry only a complete body, once. An upload stream cannot be replayed safely.
+        if (upstreamRes.statusCode === 401 && hooks?.onUnauthorized && consumed.kind === "complete") {
+          upstreamRes.destroy(); upstream.destroy();
+          res.off("close", onClose);
+          void hooks.onUnauthorized().then(headers => {
+            forward(req, res, consumed, requestPath, headers, { ...hooks, onUnauthorized: undefined });
+          }).catch(error => hooks.onError ? hooks.onError(error) : res.destroy());
+          return;
+        }
+        if (hooks?.onResponse) {
+          void hooks.onResponse(upstreamRes).catch(error => {
+            if (hooks.onError) hooks.onError(error); else res.destroy();
+          }).finally(() => upstream.destroy());
+          return;
+        }
         // Response direction: writeHead accepts a flat [name, value, ...] array
         // directly (Node's _storeHeader Array branch), preserving the upstream's
         // original header casing, order, and duplicates byte-for-byte.
@@ -212,6 +239,9 @@ export const createRawHttpForwarder = (options: PassthroughOptions): RawHttpForw
         upstreamRes.on("error", () => res.destroy());
       },
     );
+
+    requests.add(upstream);
+    upstream.once("close", () => requests.delete(upstream));
 
     // Timer arming — single-budget design (ADR-010):
     //
@@ -228,24 +258,7 @@ export const createRawHttpForwarder = (options: PassthroughOptions): RawHttpForw
     // headers-phase or stream-phase on a connected client (ADR-010).
     //
     // For pooled/keep-alive sockets (no connect phase) this budget has no effect.
-    upstream.on("socket", (socket) => {
-      socket.setNoDelay(true);
-      if (socket.connecting) {
-        socket.setTimeout(options.connectTimeoutMs);
-        const onConnectTimeout = () => {
-          socket.removeListener("connect", onConnect);
-          socket.setTimeout(0); // disarm before manual propagation
-          upstream.emit("timeout"); // triggers our handler → 504
-        };
-        const onConnect = () => {
-          socket.removeListener("timeout", onConnectTimeout);
-          socket.setTimeout(0); // disarm — no further timers (ADR-010)
-        };
-        socket.once("timeout", onConnectTimeout);
-        socket.once("connect", onConnect);
-      }
-      // Pooled/keep-alive socket: connect phase already done, no timer to arm.
-    });
+    boundTcpConnect(upstream, options.connectTimeoutMs);
 
     // Request direction: build a Map from the filtered rawHeaders so that
     // duplicates (same lowercase key, different values) are preserved as array
@@ -321,11 +334,12 @@ export const createRawHttpForwarder = (options: PassthroughOptions): RawHttpForw
     // a tick later cannot warn or write a 502 into a closed response.  Its return is
     // discarded: a client abort owns this outcome either way, and is normal — no warn
     // log, no synthetic HTTP response.
-    res.on("close", () => {
+    const onClose = () => {
       if (res.writableFinished) return;
       void settle();
       upstream.destroy();
-    });
+    };
+    res.once("close", onClose);
 
     if (consumed.kind === "complete") {
       // Full body already buffered — end the upstream in one write.  No pipe, no
@@ -349,5 +363,5 @@ export const createRawHttpForwarder = (options: PassthroughOptions): RawHttpForw
       });
     }
   };
-  return Object.assign(forward, { close: () => agent.destroy() });
+  return Object.assign(forward, { close: () => { closed = true; for (const request of requests) request.destroy(); agent.destroy(); } });
 };

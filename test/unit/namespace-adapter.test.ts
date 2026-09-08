@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { BRIDGE_NAMESPACE, NamespaceContractError, namespaceRequest, namespaceEvent } from "../../e2e/gates/namespace-adapter.js";
+import { BRIDGE_NAMESPACE, NamespaceContractError, namespaceRequest, namespaceEvent } from "../../src/collaboration-compat.js";
 import { collaborationTools } from "../../e2e/gates/contracts.js";
 
 describe("experimental collaboration namespace protocol adapter", () => {

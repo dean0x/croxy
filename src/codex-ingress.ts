@@ -24,6 +24,3 @@ export function codexIngressRoute(rawPath: string): CodexIngressRoute {
   }
   return { kind: "reserved" };
 }
-
-export const openaiErrorBody = (message: string, code = "subswitch_upstream_error"): string =>
-  JSON.stringify({ error: { message, type: "api_error", param: null, code } });

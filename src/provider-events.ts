@@ -22,7 +22,7 @@ import type { ProviderId } from "./models.js";
  * `FIELD_KEYS` in `logger.ts` is a different axis and is deliberately untouched: it
  * bounds which *fields* may be logged. Nothing here adds or widens a field.
  */
-export interface ProviderEvents<P extends ProviderId> {
+export interface ProviderEvents<P extends ProviderId | "claude" | "openai" | "anthropic"> {
   /** A request the translator could only partially represent. */
   readonly translateWarning: `${P}_translate_warning`;
   /** Reasoning effort was forwarded to the upstream. */
@@ -120,7 +120,7 @@ export interface ProviderEvents<P extends ProviderId> {
  * Callers hold the returned record for the life of the handler or translator rather
  * than re-deriving per chunk, so the hot streaming path does no string work.
  */
-export const providerEvents = <P extends ProviderId>(providerId: P): ProviderEvents<P> => ({
+const scopedEvents = <P extends ProviderId | "claude" | "openai" | "anthropic">(providerId: P): ProviderEvents<P> => ({
   translateWarning: `${providerId}_translate_warning`,
   effortApplied: `${providerId}_effort_applied`,
   upstream401Refreshing: `${providerId}_upstream_401_refreshing`,
@@ -142,3 +142,14 @@ export const providerEvents = <P extends ProviderId>(providerId: P): ProviderEve
   authFileWriteFailed: `${providerId}_auth_file_write_failed`,
   authFileUnreadableAfterRefresh: `${providerId}_auth_file_unreadable_after_refresh`,
 });
+
+export const providerEvents = <P extends ProviderId>(providerId: P): ProviderEvents<P> => scopedEvents(providerId);
+export const CLAUDE_EVENTS = {
+  ...scopedEvents("claude"), requestFailed: "claude_request_failed", requestComplete: "claude_request_complete",
+  toolCall: "claude_tool_call", toolResult: "claude_tool_result",
+} as const;
+export const OPENAI_EVENTS = {
+  ...scopedEvents("openai"), responseComplete: "codex_response_complete", websocketRejected: "openai_websocket_rejected",
+  compatOverWindowPassthrough: "codex_compat_over_window_passthrough", upstreamTimeout: "openai_upstream_timeout",
+} as const;
+export const ANTHROPIC_EVENTS = scopedEvents("anthropic");
