@@ -101,9 +101,9 @@ Key exports: `PROVIDER_IDS`, `ProviderId`, `AliasesByProvider`, `MODEL_REGISTRY`
 `parseCliArgs` returns a discriminated `CliCommand` union. Flag sets per command:
 
 - `serve`: `verbose`, `quiet`, `port`
-- `doctor`: (none — any flag on `doctor` is an error)
-- `models`: `json` only
-- `init`: `yes`, `dry-run`, `port`, `settings-target`
+- `doctor`: `client` (defaults to `all`; reverse checks run when configured)
+- `models`: `json`, `client` (defaults to `claude-code`)
+- `init`: `yes`, `dry-run`, `port`, `settings-target`, `client` (defaults to `claude-code`)
 
 Per-command flag validation walks `parseArgs` **tokens**, not `values`. The main switch is exhaustive (`default` assigns to `never` and calls `fail()`).
 
@@ -328,3 +328,20 @@ Emits to stderr. Format: `[HH:MM:SS] level=<L> event=<E> key=value …`. Fields 
 - PF-006: Doctor exits non-zero without live services; smoke uses `--version` not `doctor`; drives the `configuredProviders` severity split.
 - `.devflow/features/codex-leg/KNOWLEDGE.md` — Full model resolution contract, `buildHeaders`, `ProviderEvents<P>` 19-field table, and the Codex handler/translator/auth side.
 - `src/version.ts` — Source of `SUBSWITCH_VERSION` used by `--version`, doctor, `/__subswitch/health`, and `models --json`.
+
+## Bidirectional ingress and configuration (2026-09-08)
+
+`Config.codexIngress` enables native Codex HTTP/WebSocket ingress; its `claude` slice
+controls Claude translation. `init --client codex|all` plans native TOML and SubSwitch
+writes through `codex-init.ts` Result-returning helpers; custom upstream trust is explicit.
+`doctor --client codex` checks native setup/auth/connectivity without refresh. Default
+`doctor` selects `all` but skips disabled reverse checks. `models --json` stays version 1
+for `claude-code`; version 2 has `client: codex|all` and separately documented shapes.
+
+Configuration precedence is explicit `SUBSWITCH_CONFIG` (no merge), otherwise project
+`subswitch.config.json` over `$XDG_CONFIG_HOME/subswitch/config.json` over defaults.
+`LoadConfigResult.configPaths` lists every loaded source; legacy/unknown-provider errors
+name the source containing the offending key. `configuredProviders` reflects all sources.
+
+`src/clients.ts` owns the supported-client IDs and the `all` selector. Legacy `both`
+normalizes to `all`; model JSON uses the canonical `client: "all"` discriminator.

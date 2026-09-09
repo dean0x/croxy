@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Opt-in native Codex → Claude routing for Sonnet, Opus and Fable, while OpenAI
+  models continue to OpenAI and Codex retains native agents, tools and permissions.
+- Subscription authentication, credential refresh, readable collaboration messages,
+  streamed/non-stream responses, prompt caching and bounded process-local replay.
+- `init`, `doctor` and `models --client codex|all`, native model discovery, and a
+  user configuration fallback. Existing Claude Code setup remains the default.
+- Live native acceptance runners and shared parity follow-ups in issues #45–#48.
+
+- `--client all` selects all supported clients; `both` remains a compatibility alias.
+
+### Changed
+
+- Supported Node versions are `^22.15.0 || >=24`, matching native zstd and runtime dependency requirements. Reverse routing includes the
+  documented Claude identity preamble. Durable restart/compaction, setup undo and
+  explicit API authentication for translated inference remain separate shared work.
+
+- User-level configuration now participates in every implicit config load, including
+  forward-only runs. Project fields override it; explicit config selection bypasses it.
+  Invalid user configuration can therefore prevent startup; diagnostics show its source.
+- Raw relay headers named by `Connection` are stripped on both legs in both directions.
+- Native Codex setup requires explicit trust for a custom upstream host before it writes files.
+
+### Fixed
+
+- Native Codex conversations can continue after cancelling a Claude response; pending
+  replay handles and ordered cancellation notices no longer cause 409/400 failures.
+- Missing relay-side Claude credentials produce Claude-specific setup guidance without
+  triggering native Codex to refresh its unrelated OpenAI login. Lost continuation
+  errors now explain that a new conversation is required.
+
+- Scope native credential substitution to exact Codex endpoints and redact synthesized
+  OpenAI errors at the JSON, SSE, and WebSocket render boundaries.
+- Use async decompression, one shared continuation/replay budget, bounded upgraded
+  sockets, and the shared raw HTTP transport with one credential refresh retry.
+- Classify translation, state, internal, and upstream failures explicitly; validate
+  malformed history/catalog values and bound recursive protocol traversal.
+- Document all ingress configuration keys, model JSON schemas, and ingress log routes.
+
 ## [0.4.0] - 2026-09-01
 
 ### Changed

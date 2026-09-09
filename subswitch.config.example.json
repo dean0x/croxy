@@ -7,6 +7,29 @@
     "maxUpstreamSockets": 256,
     "allowInsecureBaseUrl": false
   },
+  "codexIngress": {
+    "enabled": false,
+    "subscriptionBaseUrl": "https://chatgpt.com/backend-api/codex",
+    "apiBaseUrl": "https://api.openai.com/v1",
+    "connectTimeoutMs": 10000,
+    "maxUpstreamSockets": 256,
+    "allowInsecureBaseUrl": false,
+    "claude": {
+      "enabled": false,
+      "baseUrl": "https://api.anthropic.com",
+      "oauthTokenUrl": "https://platform.claude.com/v1/oauth/token",
+      "aliases": {},
+      "allowInsecureBaseUrl": false,
+      "requestTimeoutMs": 600000,
+      "streamIdleTimeoutMs": 300000,
+      "maxSseEventBytes": 4194304,
+      "maxAggregateBytes": 67108864,
+      "reasoningCache": {
+        "maxEntries": 4096,
+        "maxBytes": 67108864
+      }
+    }
+  },
   "providers": {
     "codex": {
       "baseUrl": "https://chatgpt.com/backend-api/codex",

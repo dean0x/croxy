@@ -2,52 +2,38 @@
 
 [![CI](https://github.com/dean0x/subswitch/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/subswitch/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen.svg)](https://nodejs.org/)
+[![Node 22.15+ or 24+](https://img.shields.io/badge/node-22.15%2B%20or%2024%2B-brightgreen.svg)](https://nodejs.org/)
 
-**Route Claude Code subagents to a different model - keep everything else on Claude.**
+**Route native sub-agents between Claude Code and Codex, using your subscriptions.**
 
-subswitch is a local subscription-routing proxy for Claude Code. Give a subagent a
-Codex model in its frontmatter (`model: sol`) and *that subagent alone* runs
-on your **Codex subscription**; your main agent and every other request stay on
-your **claude.ai subscription**, untouched. No API keys — subswitch forwards the
-subscription credential each leg already uses.
+SubSwitch is a local protocol bridge. Claude Code can delegate a sub-agent to an
+OpenAI model; Codex can delegate a native sub-agent to a Claude model. Routing is
+selected by the requested model. The originating client keeps its agents, tools,
+permissions, and execution loop.
 
-## Why this is different
+## Model-based routing
 
-Every other Claude Code proxy is all-or-nothing. `ANTHROPIC_BASE_URL` is a single
-global setting, so existing routers point *all* of Claude Code's traffic at one
-endpoint and typically swap the model for the entire session — your orchestrator,
-your utility calls, everything moves at once.
+- **Claude Code → Codex:** registered OpenAI models and aliases are translated to
+  Responses. Other traffic continues to Anthropic as a raw relay.
+- **Codex → Claude:** registered Claude models and aliases are translated to
+  Messages. OpenAI models continue to OpenAI. Reverse-enabled sessions adapt the
+  collaboration namespace so cross-provider task messages are readable.
 
-subswitch is the first proxy that splits traffic **per subagent, by model name**:
-
-- Requests whose `model` resolves to a canonical id in the built-in model
-  registry (by exact match, family alias, or custom alias) are translated and
-  sent to the Codex backend.
-- Everything else — the main agent, background utility calls (token counting,
-  context management), all non-matching models — is relayed to Anthropic as
-  **verbatim bytes**, credentials and all.
-
-So you keep Claude Opus/Sonnet driving the session and delegate a specific
-subagent to GPT for a second opinion, a cheaper worker, or a specialized task —
-without giving up either subscription and without touching an API key.
+SubSwitch does not switch models or billing modes after a failure. Unknown models
+retain their originating provider's fallback behavior. Native settings and client
+binaries are not patched or downgraded.
 
 ```
-Claude Code ──► subswitch (127.0.0.1:4141)
-                  ├─ model ∈ registry ─────► chatgpt.com Codex backend
-                  │    (Anthropic Messages ⇄ OpenAI Responses translation,
-                  │     ~/.codex/auth.json OAuth, reasoning round-trip cache)
-                  └─ everything else ──────► api.anthropic.com
-                       (verbatim byte relay, claude.ai OAuth untouched)
-```
+Claude Code ──► SubSwitch ──► OpenAI for selected OpenAI models
+                         └─► Anthropic for other requests
 
-Routing is by the request body's `model` field, resolved against the built-in
-model registry (by exact id, family alias, or custom alias). Unresolvable models
-pass through to Anthropic; non-matching utility traffic is never misrouted.
+Codex ───────► SubSwitch ──► Anthropic for selected Claude models
+                         └─► OpenAI for other requests
+```
 
 ## Requirements
 
-- Node 22+
+- Node 22.15 or newer within Node 22, or Node 24+ (native zstd support); Node 23 is unsupported
 - A claude.ai subscription login in Claude Code (no `ANTHROPIC_API_KEY` set)
 - Codex CLI logged in (`codex login` → `~/.codex/auth.json`)
 
@@ -105,14 +91,14 @@ on Claude.
 ### CLI reference
 
 ```
-subswitch — local subscription-routing proxy for Claude Code
+subswitch — local subscription-routing proxy for Claude Code and Codex
 
 Usage: subswitch [command] [flags]
 
 Commands:
   serve     Start the proxy (default command)
-  doctor    Check config, codex auth, and network reachability
-  init      Interactive setup — writes config + wires Claude Code
+  doctor    Check config, subscription auth, and network reachability
+  init      Interactive setup — wires the selected client(s)
   models    Show effective alias table (registry × aliases)
             --json   Output model registry as JSON (no color, no TTY check)
 
@@ -131,6 +117,11 @@ Flags (init):
       --port <n>             Proxy port (default: 4141)
       --settings-target <t>  "local" (.claude/settings.local.json, default)
                              or "shared" (.claude/settings.json)
+
+Flags (init, doctor, models):
+      --client <client>     "claude-code", "codex", or "all"
+                            init/models default to claude-code; doctor defaults to all
+                            all selects supported clients; both is a compatibility alias
 
 Examples:
   subswitch serve                      # start proxy on port 4141
@@ -191,6 +182,80 @@ npm run serve      # same as `subswitch serve`
 npm run doctor     # same as `subswitch doctor`
 ```
 
+## Codex → Claude
+
+Sign in normally with both clients, then enable the reverse path:
+
+```sh
+subswitch init --client codex
+subswitch serve
+subswitch doctor --client codex
+subswitch models --client codex
+```
+
+`init --client codex --dry-run` previews changes. Use `--yes` for non-interactive
+setup, or `--client all` to configure native Codex and the existing project-level
+Claude Code integration together. The default `init` behavior remains Claude Code.
+`all` selects every client supported by this build (currently Claude Code and Codex);
+`both` remains accepted as a compatibility alias. New clients require their own adapters.
+
+Codex setup changes only the user-level `openai_base_url` value, preserving other
+TOML settings and comments. It writes SubSwitch's user config to
+`$XDG_CONFIG_HOME/subswitch/config.json` (default `~/.config/subswitch/config.json`).
+Project configuration merges over this fallback; explicit `SUBSWITCH_CONFIG`
+remains authoritative. Start the proxy before launching Codex. Existing custom
+providers are not replaced. A custom upstream is preserved only when it is loopback or
+you have explicitly set `codexIngress.allowInsecureBaseUrl: true` in the SubSwitch config.
+Setup names an unapproved host and stops before writing files.
+
+Set the model in a native Codex role file, for example `~/.codex/claude-worker.toml`:
+
+```toml
+model = "sonnet"
+model_reasoning_effort = "medium"
+```
+
+Reference that file from native `~/.codex/config.toml` if the role is not already
+configured:
+
+```toml
+[agents.claude_worker]
+description = "Delegate a task to Claude"
+config_file = "claude-worker.toml"
+```
+
+Use `sonnet`, `opus`, `fable`, or a listed canonical Claude ID. Custom aliases live
+under `codexIngress.claude.aliases`. Canonical IDs retain precedence, and family
+aliases select the newest registered generation, as in the forward resolver.
+Custom targets outside the registry can route but do not gain invented native
+capability metadata; doctor flags them for review. Model registration does not override provider
+account availability. Native model discovery preserves OpenAI's catalog and adds
+Claude entries. API-authenticated native Codex traffic retains its API endpoint;
+translated Claude inference uses the configured subscription, with no billing fallback.
+
+The reverse path uses the existing Claude Keychain/file credential store and
+refreshes it when needed. `codexIngress.claude.configDir` selects a native Claude
+configuration directory; if omitted, `CLAUDE_CONFIG_DIR` and then the native default
+apply. `codexIngress.claude.authFile` explicitly selects a file-backed store.
+Automatic prompt caching is enabled, with cached-token counts and a short hashed
+native thread identifier available in logs. If native Codex omits its bearer token on the local
+endpoint, SubSwitch uses its existing Codex credential manager only when the
+native account ID matches. Incoming credentials are never reused for Claude.
+
+Claude subscription requests include a native identity system preamble. This
+compatibility behavior is explicit; SubSwitch does not forge billing attestations,
+rewrite product names in user instructions, or run a second agent runtime. Provider
+credential-use policies still apply. See [security](SECURITY.md) and the
+[live verification notes](e2e/gates/production-parity.md).
+
+State is process-local in both directions. Durable restart/resume and translated
+compaction are tracked in [#45](https://github.com/dean0x/subswitch/issues/45), setup
+undo in [#46](https://github.com/dean0x/subswitch/issues/46), explicit API auth for
+both translating paths in [#47](https://github.com/dean0x/subswitch/issues/47), and
+broader content/tool support in [#48](https://github.com/dean0x/subswitch/issues/48).
+These are not included in the parity release. Missing reverse continuation state
+produces an explicit error; keep the proxy running during active translated sessions.
+
 ## Effort control
 
 The optional `effort` frontmatter field works on the Codex leg too. Claude Code
@@ -210,7 +275,13 @@ default.
 The config file is located by the following precedence (highest wins):
 
 1. `SUBSWITCH_CONFIG` env var — absolute or `~`-relative path; **missing file is an error**
-2. `subswitch.config.json` in the current working directory — silently uses defaults if absent
+2. `subswitch.config.json` in the current working directory, merged over the user fallback
+3. `$XDG_CONFIG_HOME/subswitch/config.json` (default `~/.config/subswitch/config.json`), then built-in defaults
+
+An explicit `SUBSWITCH_CONFIG` file is authoritative and is not merged with the user fallback.
+This merge applies to all commands, including forward-only use. `doctor` displays every
+loaded source, and errors identify source paths. Explicit config paths passed by callers
+of `loadConfig` also bypass the merge.
 
 **An unrecognised key is rejected, not ignored.** Two checks run against the raw file
 before it is parsed, and a hit on either is a hard load failure — subswitch prints the
@@ -291,12 +362,30 @@ All keys and their defaults:
 | `providers.codex.allowInsecureBaseUrl` | `false` | **Security opt-in** — when false (the default), `subswitch serve` refuses to start if `providers.codex.baseUrl` or `providers.codex.oauthTokenUrl` points at a host other than `chatgpt.com` or `auth.openai.com`. This prevents credential forwarding to an untrusted host. Set to `true` only when routing through a trusted proxy. Loopback addresses are always exempt. |
 | `limits.maxBufferedBodyBytes` | `33554432` (32 MiB) | Maximum request body bytes the relay buffers. A larger body is streamed to Anthropic unmodified; on a translated (Codex) route it is answered `413 request_too_large`. |
 | `limits.pingIntervalMs` | `15000` (15 s) | Interval between SSE ping frames sent to clients during long Codex streams |
+| `codexIngress.enabled` | `false` | Enable the reserved native Codex ingress endpoints. |
+| `codexIngress.subscriptionBaseUrl` | `"https://chatgpt.com/backend-api/codex"` | Native Codex subscription upstream. |
+| `codexIngress.apiBaseUrl` | `"https://api.openai.com/v1"` | Native OpenAI API upstream; uses client-supplied credentials. |
+| `codexIngress.connectTimeoutMs` | `10000` | TCP connection establishment budget only; no TLS, HTTP-header, or WebSocket-handshake deadline. |
+| `codexIngress.maxUpstreamSockets` | `256` | Maximum sockets per raw HTTP upstream pool, plus a shared bound for native upstream WebSocket lifetimes. |
+| `codexIngress.allowInsecureBaseUrl` | `false` | **Security opt-in** — allow non-default OpenAI upstream hosts or ports only when trusted. Loopback is exempt. |
+| `codexIngress.claude.enabled` | `false` | Enable Claude model resolution, translation, discovery, and collaboration namespace adaptation. |
+| `codexIngress.claude.baseUrl` | `"https://api.anthropic.com"` | Claude Messages upstream. |
+| `codexIngress.claude.oauthTokenUrl` | `"https://platform.claude.com/v1/oauth/token"` | Claude subscription refresh endpoint. |
+| `codexIngress.claude.configDir` | `unset` | Native Claude config directory; otherwise uses `CLAUDE_CONFIG_DIR` or `~/.claude`. |
+| `codexIngress.claude.authFile` | `unset` | Explicit credential file; otherwise uses the native macOS Keychain or the config directory credential file. |
+| `codexIngress.claude.aliases` | `{}` | Custom aliases targeting `claude-*` IDs; cannot claim OpenAI names. Exact canonical IDs retain precedence. |
+| `codexIngress.claude.allowInsecureBaseUrl` | `false` | **Security opt-in** — allow trusted non-default Claude inference/refresh hosts or ports. Loopback is exempt. |
+| `codexIngress.claude.requestTimeoutMs` | `600000` | Wall-clock limit for each translated Claude request, including refresh and streaming. |
+| `codexIngress.claude.streamIdleTimeoutMs` | `300000` | Maximum upstream SSE idle interval; resets when data arrives. |
+| `codexIngress.claude.maxSseEventBytes` | `4194304` | Maximum bytes in one Claude SSE event. |
+| `codexIngress.claude.maxAggregateBytes` | `67108864` | Maximum accumulated Claude event bytes per response; excess returns a synthesized 502. |
+| `codexIngress.claude.reasoningCache.maxEntries` | `4096` | Shared LRU entry ceiling across continuation snapshots, thinking replay, and adapted-response markers. |
+| `codexIngress.claude.reasoningCache.maxBytes` | `67108864` | Shared serialized UTF-8 byte ceiling, including cache keys. Oversized entries are not cached; evicted continuation/replay state returns 409. |
 
-> **Why `connectTimeoutMs` and `maxUpstreamSockets` are Anthropic-leg-only**: the
-> Anthropic passthrough uses a node:http agent with an explicit keep-alive pool, so
-> both knobs have meaningful effect there. The Codex leg uses Node's global `fetch`
-> (undici's global dispatcher), which these knobs do not control — shipping them as
-> per-provider keys would be config that bounds nothing on the Codex side.
+> **Transport scope**: `anthropic.*` and `codexIngress.*` transport limits control their
+> raw HTTP pools. `codexIngress.maxUpstreamSockets` also bounds the total pending/active
+> upstream WebSocket connections until they close; waiting clients acquire a slot when
+> one closes. Translating provider requests use `fetch` and their own request/idle limits.
 
 > **Operator caveats for `connectTimeoutMs`**: (1) **No effect on pooled sockets.**
 > With `maxUpstreamSockets: 256` and keep-alive on, steady-state traffic reuses
@@ -401,7 +490,8 @@ subswitch models --json | jq .models[].id
 **Field notes**:
 
 - `schemaVersion` is an integer that bumps on any breaking change to this structure.
-  Consumers must check `schemaVersion === 1` before reading other fields.
+  Consumers of the default/`--client claude-code` shape must check `schemaVersion === 1` before reading other fields.
+  The Codex and combined shapes use version 2 and the `client` discriminator described below.
 - `gen` is an integer tuple (`[5, 6]`), not a string (`"5.6"`). String comparison sorts
   `"5.10"` before `"5.9"` — the tuple is the correct form for numeric comparison.
   `gen` is omitted when the generation is unknown; it is always present for registry entries.
@@ -413,6 +503,17 @@ subswitch models --json | jq .models[].id
   identifies where everything unresolved goes.
 - `aliases[].source` is `"derived"` for family aliases computed from the registry, or
   `"config"` for entries you wrote in `providers.codex.aliases`.
+
+For `--client codex`, version 2 has this shape (model rows are abbreviated):
+
+```json
+{"kind":"models","schemaVersion":2,"client":"codex","subswitchVersion":"0.4.0","fallbackProvider":"codex","enabled":true,"models":[{"id":"claude-sonnet-5","provider":"claude","registered":true,"aliases":["sonnet"]}]}
+```
+
+For `--client all`, version 2 uses `client: "all"` and a `clients` object:
+`{"kind":"models","schemaVersion":2,"client":"all","clients":{"claude-code":<version-1 object>,"codex":<version-2 Codex object>}}`.
+Branch on both `schemaVersion` and `client`. Codex rows contain `id`, `provider`,
+`registered`, and `aliases`; they do not use the version-1 row schema.
 
 ## How the Codex leg works
 
@@ -432,6 +533,34 @@ subswitch models --json | jq .models[].id
 - **Response**: Responses SSE is translated to the Anthropic SSE event
   sequence, with pings during upstream silence; non-streaming clients get an
   aggregated JSON message.
+
+## How the Claude reverse leg works
+
+- **Auth:** reads native Claude subscription storage and refreshes a rejected token once.
+  Requests include the Claude subscription identity preamble and beta headers. Native
+  OpenAI credentials never reach Claude; translated failures never switch billing modes.
+- **Routing:** HTTP and WebSocket requests use the same resolved Claude destination and
+  route decision. Unresolved models retain OpenAI handling. Operator Codex credential
+  substitution is limited to exact `/responses`, `/responses/compact`, and `/models` paths
+  in subscription mode and requires a matching native account.
+- **Translation:** Responses input becomes Messages history. Text streams incrementally;
+  executable tool calls commit only after a valid terminal message. Response protocol
+  failures return 502; missing process-local continuation or thinking state returns 409
+  with guidance to start a new conversation. Missing relay-side Claude credentials return
+  503 with Claude-specific sign-in guidance, avoiding an unrelated native OpenAI login refresh.
+- **State:** snapshots, authenticated thinking replay, and collaboration adaptation markers
+  share one bounded process-local LRU. Interrupted streams retain an empty replay handle
+  so native cancellation notices and readable partial text can continue in the same
+  conversation. Unfinished thinking and tool calls are not replayed. Restart or eviction
+  makes that state unavailable.
+- **Collaboration:** when Claude routing is enabled, native collaboration definitions and
+  structured calls are adapted for the whole Codex session, including OpenAI turns. The
+  affected message arguments use the explicit plaintext tool contract. Existing opaque
+  histories and prompt text remain unchanged; encrypted arguments cannot become executable
+  plaintext calls. Disabling Claude routing disables this adaptation.
+- **Raw relay:** connection-specific headers, including headers named by `Connection`, are
+  stripped on both legs in both directions. Other provider headers and payload bytes survive.
+  The `/codex` namespace stays reserved when disabled and returns OpenAI-shaped errors.
 
 ## Logging
 
@@ -460,10 +589,14 @@ how the request was dispatched. Valid values:
 | `anthropic:fallback` | Fail-open forward: colon-qualified name whose prefix is not a registered provider; relay forwards to Anthropic and emits `unknown_provider_qualifier` warn |
 | `codex:{endpoint}:{model}` | Request routed to the Codex provider leg (e.g. `codex:messages:gpt-5.6-sol`, `codex:count_tokens:gpt-5.6-sol`) |
 | `host_rejected` | Request refused by the loopback `Host`/`Origin` gate before routing; relay returned a synthesized 403 |
+| `codex_ingress:subscription:passthrough` | Subscription-mode Codex ingress; the gateway may translate a resolved Claude request. |
+| `codex_ingress:api:passthrough` | API-mode Codex ingress; the gateway may translate a resolved Claude request. |
+| `codex_ingress:unknown` | Reserved `/codex` path not belonging to either supported endpoint base. |
 | `internal_error` | Unhandled exception during request handling; relay returned a synthesized 500 |
 
 The `anthropic:ambiguous` and `anthropic:fallback` values both carry the `anthropic` prefix so
-leg-level filtering (`route starts with anthropic`) continues to work. The suffix makes
+leg-level filtering (`route starts with anthropic`) continues to work. Codex ingress
+uses the separate `codex_ingress` prefix; its ingress route label is not a destination-provider label. The suffix makes
 fail-open forwards distinguishable from intended Anthropic routes in log queries and alerting.
 
 ### Log events

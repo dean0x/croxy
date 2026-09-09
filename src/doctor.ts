@@ -215,6 +215,7 @@ const LABEL_WIDTH = 22;
 
 /** Format one doctor output row with a consistent label column width. */
 const row = (label: string, value: string): string => `  ${label}`.padEnd(LABEL_WIDTH) + value;
+export { row as doctorRow };
 
 /**
  * Run all doctor checks and write output to io.write.

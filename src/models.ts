@@ -196,7 +196,7 @@ export const routableModelCount = (registry: readonly ModelEntry[], provider: Pr
  *
  * noUncheckedIndexedAccess: every element read uses ?? 0.
  */
-const compareGen = (a: readonly number[], b: readonly number[]): number => {
+export const compareGen = (a: readonly number[], b: readonly number[]): number => {
   const len = Math.max(a.length, b.length);
   for (let i = 0; i < len; i++) {
     const ai = a[i] ?? 0;

@@ -1,12 +1,15 @@
+import { vetCredentialUrl } from "./upstream-policy.js";
+import { ClaudeAuthManager, createClaudeCredentialStore } from "./claude-auth.js";
+import { openaiErrorBody } from "./errors.js";
 import http from "node:http";
 import { existsSync } from "node:fs";
 import type { IncomingMessage, Server } from "node:http";
 import { toAnthropicErrorBody, SYNTHESIZED_HEADER, SYNTHESIZED_MARKER } from "./errors.js";
 import { applyInboundPolicy, hostGateVerdict, SERVER_TUNING } from "./inbound-policy.js";
 import { type Result, ok, err } from "./result.js";
-import { aliasesByProvider, enumerateDestinations, isLoopbackHost, providerConfigFor, type Config } from "./config.js";
+import { aliasesByProvider, enumerateDestinations, providerConfigFor, type Config } from "./config.js";
 import { createConsoleLogger, type Logger } from "./logger.js";
-import { providerEvents } from "./provider-events.js";
+import { CLAUDE_EVENTS, OPENAI_EVENTS, ANTHROPIC_EVENTS, providerEvents } from "./provider-events.js";
 import { decideRoute } from "./router.js";
 import { createAnthropicForwarder, type AnthropicForwarder, type ForwardedBody } from "./anthropic-passthrough.js";
 import { sniffLeadingModel, MODEL_SNIFF_BYTES } from "./anthropic-parse.js";
@@ -27,12 +30,19 @@ import {
 } from "./models.js";
 import { SUBSWITCH_NAME, SUBSWITCH_VERSION } from "./version.js";
 import type { ProviderHandler } from "./provider-handler.js";
+import { codexIngressRoute } from "./codex-ingress.js";
+import { rejectCodexUpgrade, type CodexIngressEntry } from "./openai-passthrough.js";
+import { CodexGateway } from "./codex-gateway.js";
+import { hasNativeDecoders } from "./content-encoding.js";
+import { claudeResolver } from "./claude-models.js";
+import { codexIngressHealth } from "./codex-health.js";
 
 export interface ServerDeps {
   readonly config: Config;
   readonly logger: Logger;
   /** Privileged default leg — handles everything that is not POST /v1/messages*. */
   readonly forwardAnthropic: AnthropicForwarder;
+  readonly forwardOpenai: CodexIngressEntry | undefined;
   /**
    * Provider dispatch table. `Record<ProviderId, …>` — NOT `Partial`, NOT `Map`.
    * Adding a `ProviderId` without a handler is a compile error: the whole point of
@@ -55,17 +65,13 @@ export interface ServerDeps {
  * only allocated when a Codex provider is actually wired — not unconditionally
  * for every process. (applies ADR-002)
  */
-const createCodexProvider = (config: Config, logger: Logger): ProviderHandler => {
+const createCodexAuth = (config: Config, logger: Logger): ProviderAuth<"codex"> => new CodexAuthManager({
+  store: createFsAuthFileStore(config.providers.codex.authFile),
+  oauthTokenUrl: config.providers.codex.oauthTokenUrl, logger, events: providerEvents("codex"),
+});
+
+const createCodexProvider = (config: Config, logger: Logger, auth: ProviderAuth<"codex">): ProviderHandler => {
   const provider = config.providers.codex;
-  // Annotated rather than inferred: conformance is then checked here as well as at
-  // `implements ProviderAuth<"codex">`, so an edit to CodexAuthManager that broke the
-  // brand fails at the wiring site too — the place a mismatched credential enters.
-  const auth: ProviderAuth<"codex"> = new CodexAuthManager({
-    store: createFsAuthFileStore(provider.authFile),
-    oauthTokenUrl: provider.oauthTokenUrl,
-    logger,
-    events: providerEvents("codex"),
-  });
   return createCodexHandler({
     providerId: "codex",
     provider,
@@ -94,99 +100,38 @@ const createCodexProvider = (config: Config, logger: Logger): ProviderHandler =>
  */
 export const buildDeps = (config: Config, logger: Logger = createConsoleLogger(config.logLevel)): Result<ServerDeps, string> => {
 
-  // Vet each provider's credential-carrying URLs at startup.
-  //
-  // Two controls, both per-provider by construction (one provider's defaultHost cannot
-  // accidentally vet another's baseUrl):
-  //   1. SCHEME: http:// to a non-loopback host sends credentials in cleartext — warn.
-  //      Loopback (127.*/localhost/::1) is exempt; the e2e dev workflow uses
-  //      http://127.0.0.1:4142 intentionally.
-  //   2. HOST: a URL on a different hostname than this provider's expected default
-  //      sends credentials to a third-party host — FATAL unless allowInsecureBaseUrl.
-  //      Loopback hosts are always exempt.
-  //
-  // Both baseUrl (short-lived access token) and oauthTokenUrl (long-lived refresh
-  // token) are swept. oauthTokenUrl carries the more damaging credential.
-  //
-  // Anthropic baseUrl is checked separately below (not a ProviderId, so it is outside
-  // this loop, but the threat model is the same: a sk-ant-* key forwarded to a
-  // non-default host).
-  //
-  // z.url() in the config schema validates URL format; z.refine(requireHttpsOrLoopback)
-  // rejects http:// non-loopback at parse time — this loop is defence in depth and also
-  // catches programmatically-constructed Config objects that bypass Zod.
+  if (config.codexIngress.enabled && config.codexIngress.claude.enabled && !hasNativeDecoders())
+    return err("Codex → Claude routing requires native zstd support. Use Node 22.15 or newer; forward routing remains available.");
+
+  // All credential-bearing URL checks share the same opt-in vocabulary and diagnostics.
+  for (const [key, expectedHost] of [["baseUrl", "api.anthropic.com"], ["oauthTokenUrl", "platform.claude.com"]] as const) {
+    const result = vetCredentialUrl({ url: config.codexIngress.claude[key], path: `codexIngress.claude.${key}`,
+      expectedHost, optInKey: "codexIngress.claude.allowInsecureBaseUrl", allowOverride: config.codexIngress.claude.allowInsecureBaseUrl,
+      logger, events: CLAUDE_EVENTS, refreshToken: key === "oauthTokenUrl" });
+    if (!result.ok) return result;
+  }
+  for (const [key, expectedHost] of [["subscriptionBaseUrl", "chatgpt.com"], ["apiBaseUrl", "api.openai.com"]] as const) {
+    const result = vetCredentialUrl({ url: config.codexIngress[key], path: `codexIngress.${key}`,
+      expectedHost, optInKey: "codexIngress.allowInsecureBaseUrl", allowOverride: config.codexIngress.allowInsecureBaseUrl,
+      logger, events: OPENAI_EVENTS });
+    if (!result.ok) return result;
+  }
   for (const id of PROVIDER_IDS) {
-    const { baseUrl, defaultHost, oauthTokenUrl, defaultOauthHost, allowInsecureBaseUrl } = providerConfigFor(config, id);
-    const events = providerEvents(id);
-
-    // Check baseUrl scheme and hostname.
-    // new URL() is safe: z.url() already validated the URL at config-parse time.
-    const parsedBase = new URL(baseUrl);
-    if (!isLoopbackHost(parsedBase.hostname)) {
-      if (parsedBase.protocol !== "https:") {
-        logger.log("warn", events.insecureBaseUrlScheme);
-      }
-      if (parsedBase.hostname !== defaultHost) {
-        if (!allowInsecureBaseUrl) {
-          logger.log("error", events.baseUrlHostRejected, { path: `providers.${id}.baseUrl` });
-          return err(
-            `providers.${id}.baseUrl points at '${parsedBase.hostname}' (expected '${defaultHost}'). ` +
-            `Credentials would be sent to an untrusted host. ` +
-            `Set "providers.${id}.allowInsecureBaseUrl": true in subswitch.config.json to opt in.`,
-          );
-        }
-        logger.log("warn", events.baseUrlOverrideDetected);
-      }
-    }
-
-    // Check oauthTokenUrl scheme and hostname (present only for OAuth providers).
-    // oauthTokenUrl carries the long-lived refresh token — more damaging to expose than
-    // the short-lived access token in baseUrl.
-    if (oauthTokenUrl !== undefined && defaultOauthHost !== undefined) {
-      const parsedOauth = new URL(oauthTokenUrl);
-      if (!isLoopbackHost(parsedOauth.hostname)) {
-        if (parsedOauth.protocol !== "https:") {
-          logger.log("warn", events.insecureBaseUrlScheme);
-        }
-        if (parsedOauth.hostname !== defaultOauthHost) {
-          if (!allowInsecureBaseUrl) {
-            logger.log("error", events.baseUrlHostRejected, { path: `providers.${id}.oauthTokenUrl` });
-            return err(
-              `providers.${id}.oauthTokenUrl points at '${parsedOauth.hostname}' (expected '${defaultOauthHost}'). ` +
-              `Your long-lived refresh token would be sent to an untrusted host. ` +
-              `Set "providers.${id}.allowInsecureBaseUrl": true in subswitch.config.json to opt in.`,
-            );
-          }
-          logger.log("warn", events.baseUrlOverrideDetected);
-        }
-      }
+    const provider = providerConfigFor(config, id);
+    const urls = [
+      { url: provider.baseUrl, expectedHost: provider.defaultHost, key: "baseUrl", refreshToken: false },
+      ...(provider.oauthTokenUrl && provider.defaultOauthHost ? [{ url: provider.oauthTokenUrl,
+        expectedHost: provider.defaultOauthHost, key: "oauthTokenUrl", refreshToken: true }] : []),
+    ];
+    for (const url of urls) {
+      const result = vetCredentialUrl({ ...url, path: `providers.${id}.${url.key}`, optInKey: `providers.${id}.allowInsecureBaseUrl`,
+        allowOverride: provider.allowInsecureBaseUrl, logger, events: providerEvents(id) });
+      if (!result.ok) return result;
     }
   }
-
-  // Anthropic leg: same threat model — a sk-ant-* key forwarded verbatim to a
-  // non-default host. `anthropic` is not a ProviderId, so the check is separate and
-  // uses hardcoded event-name literals, following the existing pattern for
-  // "anthropic_insecure_base_url_scheme".
-  {
-    const ANTHROPIC_DEFAULT_HOST = "api.anthropic.com";
-    const parsedAnthropic = new URL(config.anthropic.baseUrl);
-    if (!isLoopbackHost(parsedAnthropic.hostname)) {
-      if (parsedAnthropic.protocol !== "https:") {
-        logger.log("warn", "anthropic_insecure_base_url_scheme");
-      }
-      if (parsedAnthropic.hostname !== ANTHROPIC_DEFAULT_HOST) {
-        if (!config.anthropic.allowInsecureBaseUrl) {
-          logger.log("error", "anthropic_base_url_host_rejected", { path: "anthropic.baseUrl" });
-          return err(
-            `anthropic.baseUrl points at '${parsedAnthropic.hostname}' (expected '${ANTHROPIC_DEFAULT_HOST}'). ` +
-            `Credentials would be sent to an untrusted host. ` +
-            `Set "anthropic.allowInsecureBaseUrl": true in subswitch.config.json to opt in.`,
-          );
-        }
-        logger.log("warn", "anthropic_base_url_override_detected");
-      }
-    }
-  }
+  const anthropic = vetCredentialUrl({ url: config.anthropic.baseUrl, path: "anthropic.baseUrl", expectedHost: "api.anthropic.com",
+    optInKey: "anthropic.allowInsecureBaseUrl", allowOverride: config.anthropic.allowInsecureBaseUrl, logger, events: ANTHROPIC_EVENTS });
+  if (!anthropic.ok) return anthropic;
 
   // Build the routing table once. The resolver is a pure closure over this table;
   // "built once at startup" is a structural guarantee, not a comment. (applies ADR-005)
@@ -211,9 +156,17 @@ export const buildDeps = (config: Config, logger: Logger = createConsoleLogger(c
     logger.log("warn", "registry_entry_uses_reserved_name", { model: id });
   }
 
+  const resolveClaude = claudeResolver(config.codexIngress.claude.aliases);
+  if (resolveClaude.rejectedAliases.length) return err(`Invalid Claude aliases: ${resolveClaude.rejectedAliases.join(", ")}`);
+  const codexAuth = createCodexAuth(config, logger);
+
   return ok({
     config,
     logger,
+    forwardOpenai: config.codexIngress.enabled ? new CodexGateway({ config, logger, parentAuth: codexAuth, resolveClaude,
+      claudeAuth: new ClaudeAuthManager({ store: createClaudeCredentialStore(config.codexIngress.claude),
+        oauthTokenUrl: config.codexIngress.claude.oauthTokenUrl, logger }),
+    }) : undefined,
     forwardAnthropic: createAnthropicForwarder({
       baseUrl: config.anthropic.baseUrl,
       connectTimeoutMs: config.anthropic.connectTimeoutMs,
@@ -221,7 +174,7 @@ export const buildDeps = (config: Config, logger: Logger = createConsoleLogger(c
       logger,
     }),
     providers: {
-      codex: createCodexProvider(config, logger),
+      codex: createCodexProvider(config, logger, codexAuth),
     },
     resolve: (name) => resolveModelFromTable(table, name),
   });
@@ -262,6 +215,7 @@ const buildHealthBody = (config: Config): string =>
   JSON.stringify({
     name: SUBSWITCH_NAME,
     version: SUBSWITCH_VERSION,
+    codexIngress: codexIngressHealth(config),
     providers: enumerateDestinations(config).map((d) => {
       if (d.routing === "passthrough") {
         // Anthropic is always reachable — no auth file, no model list. (applies ADR-002)
@@ -397,13 +351,27 @@ const synthesizedHeaders = (): Record<string, string> => ({
   [SYNTHESIZED_HEADER]: SYNTHESIZED_MARKER,
 });
 
+/** Own upgraded-connection shutdown before Node waits for listener connections to drain. */
+class SubswitchServer extends http.Server {
+  constructor(private readonly closeUpstreamConnections: () => void, handler: http.RequestListener) {
+    super({ maxHeaderSize: SERVER_TUNING.maxHeaderSize }, handler);
+  }
+
+  override close(callback?: (error?: Error) => void): this {
+    this.closeUpstreamConnections();
+    return super.close(callback);
+  }
+}
+
 export const createProxyServer = (deps: ServerDeps): Server => {
   const { config, logger } = deps;
 
-  const server = http.createServer({ maxHeaderSize: SERVER_TUNING.maxHeaderSize }, (req, res) => {
+  const server = new SubswitchServer(() => { deps.forwardOpenai?.close(); deps.forwardAnthropic.close?.(); }, (req, res) => {
     const startedAt = Date.now();
     const path = req.url ?? "/";
     const pathname = path.split("?")[0] ?? path;
+    const ingress = codexIngressRoute(path);
+    const logPath = ingress.kind === "other" ? pathname : "/codex";
     let model: string | undefined;
     let route = "anthropic";
     let bodyMode: "buffered" | "streamed" | undefined;
@@ -415,7 +383,7 @@ export const createProxyServer = (deps: ServerDeps): Server => {
       // client that vanished mid-upload identically to a served request.
       if (!res.headersSent) {
         logger.log("info", "client_disconnected", {
-          path: pathname,
+          path: logPath,
           route,
           ...(model !== undefined ? { model } : {}),
           latencyMs: Date.now() - startedAt,
@@ -423,7 +391,7 @@ export const createProxyServer = (deps: ServerDeps): Server => {
         return;
       }
       logger.log("info", "request_complete", {
-        path: pathname,
+        path: logPath,
         route,
         ...(model !== undefined ? { model } : {}),
         ...(bodyMode !== undefined ? { bodyMode } : {}),
@@ -451,17 +419,32 @@ export const createProxyServer = (deps: ServerDeps): Server => {
         route = "host_rejected";
         // The rejected value is sanitised and capped by hostGateVerdict; the body
         // carries a fixed message and never echoes it back to the caller.
-        logger.log("warn", "host_rejected", { path: pathname, errorCode: `${gate.reason} ${gate.observed}`, status: 403 });
+        logger.log("warn", "host_rejected", { path: logPath, errorCode: `${gate.reason} ${gate.observed}`, status: 403 });
         // 403/permission_error: a status and type the origin itself emits (applies
         // ADR-010 — a Host naming a domain this relay does not serve is a request the
         // origin would never have received), rendered through the error chokepoint
         // (applies ADR-008).
         res.writeHead(403, synthesizedHeaders());
-        res.end(toAnthropicErrorBody("permission_error", gate.message));
+        res.end(ingress.kind === "other" ? toAnthropicErrorBody("permission_error", gate.message) :
+          openaiErrorBody(gate.message, "subswitch_host_rejected"));
         // The upload may still be in flight.  Same reasoning as the 413 below:
         // destroying the socket here makes the kernel send RST and the client may
         // discard the 403 it was just sent.
         drainRejectedUpload(req);
+        return;
+      }
+
+      // Reserve the whole Codex namespace before the Claude-facing fallback.
+      if (ingress.kind !== "other") {
+        route = ingress.kind === "codex" ? `codex_ingress:${ingress.mode}:passthrough` : "codex_ingress:unknown";
+        if (ingress.kind === "reserved" || !deps.forwardOpenai) {
+          res.writeHead(ingress.kind === "reserved" ? 404 : 503, synthesizedHeaders());
+          res.end(openaiErrorBody(ingress.kind === "reserved" ? "unknown Codex ingress path" :
+            "Codex passthrough is disabled; enable codexIngress.enabled to use this endpoint"));
+          drainRejectedUpload(req);
+          return;
+        }
+        deps.forwardOpenai.http(req, res, ingress.mode, ingress.path);
         return;
       }
 
@@ -635,10 +618,11 @@ export const createProxyServer = (deps: ServerDeps): Server => {
 
     dispatch().catch((cause: unknown) => {
       route = "internal_error";
-      logger.log("error", "request_failed", { path: pathname, errorCode: cause instanceof Error ? cause.name : "unknown" });
+      logger.log("error", "request_failed", { path: logPath, errorCode: cause instanceof Error ? cause.name : "unknown" });
       if (!res.headersSent) {
         res.writeHead(500, synthesizedHeaders());
-        res.end(toAnthropicErrorBody("api_error", "subswitch internal error — this is a proxy fault, not an upstream failure"));
+        const message = "subswitch internal error — this is a proxy fault, not an upstream failure";
+        res.end(ingress.kind === "other" ? toAnthropicErrorBody("api_error", message) : openaiErrorBody(message));
       } else if (!res.writableEnded) {
         res.destroy();
       }
@@ -652,8 +636,19 @@ export const createProxyServer = (deps: ServerDeps): Server => {
   // clientError handler that owns the responses those knobs produce.  One call —
   // the two halves are not separately applicable by design (PF-021).
   // `maxHeaderSize` is the exception: it is constructor-only and is passed into
-  // http.createServer above.
+  // SubswitchServer above.
   applyInboundPolicy(server, logger);
 
+  server.on("upgrade", (req, socket, head) => {
+    socket.on("error", () => socket.destroy());
+    const gate = hostGateVerdict(req.headers);
+    const ingress = codexIngressRoute(req.url ?? "/");
+    const reject = (status: number, message: string) => rejectCodexUpgrade(req, socket, status, message,
+      ingress.kind === "other" ? text => toAnthropicErrorBody(status === 403 ? "permission_error" : "not_found_error", text) : openaiErrorBody);
+    if (gate.kind === "reject") { reject(403, gate.message); return; }
+    if (ingress.kind !== "codex") { reject(404, "unknown upgrade path"); return; }
+    if (!deps.forwardOpenai) { rejectCodexUpgrade(req, socket, 503, "Codex passthrough is disabled"); return; }
+    deps.forwardOpenai.upgrade(req, socket, head, ingress.mode, ingress.path);
+  });
   return server;
 };

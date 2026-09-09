@@ -1,5 +1,12 @@
 # subswitch end-to-end verification
 
+The [production Codex → Claude path](gates/production-parity.md) passes live native
+sub-agent/tool round trips and follow-ups. Enable it with `init --client codex` or
+`init --client both`. The [scope matrix](gates/parity-scope.md) records shared
+follow-ups outside the current parity implementation.
+
+The instructions below cover the existing Claude Code → OpenAI direction.
+
 Manual verification against the real Claude Code CLI and real upstreams.
 Run each step in order; every step depends on the previous one working.
 

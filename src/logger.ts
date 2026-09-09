@@ -130,8 +130,8 @@ export const createConsoleLogger = (
       // Every event name in the tree is a compile-time string literal — no config value
       // and no request value can become one — which is the primary control; this is
       // defence in depth. The guarantee is fully table-derived: all provider-scoped
-      // names come from providerEvents(providerId) (ProviderEvents<P> in provider-events.ts)
-      // and so are keyed to the closed ProviderId union. This includes the seven auth
+      // names come from the closed provider-events.ts tables (including CLAUDE_EVENTS
+      // and OPENAI_EVENTS for native ingress). This includes the seven auth
       // events in codex-auth.ts, which were formerly hardcoded `codex_*` literals
       // outside that table and have been brought in.
       const eventStr = `event=${pc.bold(renderToken(event))}`;

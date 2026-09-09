@@ -358,3 +358,34 @@ IncomingMessage (Anthropic wire)
 - PF-012: The mutation-proof pass needs its own controls
 - PF-013: The live Codex `/responses` stream sends no content-type header — the recorder cannot capture SSE without this
 - `.devflow/features/cli-ux/KNOWLEDGE.md` — CLI UX layer; `subswitch models` command; doctor agent-scan; N-provider fan-out; `ProviderEvents<P>` compile-time log-injection control
+
+## Native Codex → Claude ingress (2026-09-08)
+
+The forward leg described above remains the default. `Config.codexIngress` adds an
+opt-in reverse leg, enabled by `init --client codex|all`. Claude models and aliases
+resolve by exact membership; `decideCodexRoute` consumes a typed resolution for both
+HTTP and WebSockets. `CodexGateway` wires `CodexUpstream`, `CodexWebSockets`, native auth,
+and `ClaudeHandler`. Both HTTP directions use `createRawHttpForwarder`; only complete
+native requests with substituted credentials may refresh and retry once after 401.
+
+Claude credential infrastructure is created in `buildDeps`. Native token substitution
+is restricted to exact native endpoints and matching account IDs. `errors.ts` owns both
+wire protocols' redaction. `claude-errors.ts` maps each failure code to an explicit status.
+`ClaudeCache` shares the configured `codexIngress.claude.reasoningCache` budget across
+continuation snapshots, thinking replay, and adaptation markers. Missing state returns
+409. `content-encoding.ts` owns async codecs and the native zstd capability check.
+
+`claude-adapter.ts` translates complete histories; `claude-stream.ts` tracks explicit
+stream phases and per-block state, then commits executable tools only at a valid terminal.
+Collaboration namespace adaptation applies to OpenAI turns too when Claude routing is
+enabled. All `/codex` paths are reserved even when disabled. Raw TCP connect budgets do
+not impose TLS, HTTP-header, WebSocket-handshake, or established-stream deadlines.
+
+CLI `--client` defaults and merged configuration provenance are documented in the CLI UX
+KB. Both directions use `allowInsecureBaseUrl` for explicit custom-host trust. Native
+upgraded sockets keep a separate capacity slot until the client connection closes.
+
+Native cancellation keeps an empty, bounded replay placeholder until a valid terminal.
+The ordered `<turn_aborted>` notice and readable partial history can then continue
+without replaying unfinished thinking or tools. Missing relay-side Claude credentials
+return 503 so native Codex does not refresh its unrelated OpenAI login.

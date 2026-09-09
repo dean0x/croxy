@@ -130,3 +130,30 @@ export const toAnthropicErrorBody = (type: AnthropicErrorType, message: string):
 
 export const toAnthropicErrorSse = (type: AnthropicErrorType, message: string): string =>
   `event: error\ndata: ${toAnthropicErrorBody(type, message)}\n\n`;
+
+/** OpenAI ingress shares the render-time redaction boundary with Anthropic ingress. */
+export const openaiError = (message: string, code = "subswitch_upstream_error") => ({
+  type: "api_error", param: null, code: redactCredentials(code), message: redactCredentials(message),
+});
+
+export const openaiErrorBody = (message: string, code = "subswitch_upstream_error"): string =>
+  JSON.stringify({ error: openaiError(message, code) });
+
+export const openaiFailureEvent = (
+  message: string, code: string, stream: { id: string; model: string; sequence: number },
+) => ({
+  type: "response.failed", sequence_number: stream.sequence + 1,
+  response: {
+    id: stream.id, object: "response", model: stream.model, created_at: Math.floor(Date.now() / 1000),
+    status: "failed", output: [], error: openaiError(message, code),
+  },
+});
+
+export const openaiWebSocketError = (
+  failure: { status: number; message: string; code: string; retryAfter?: string | undefined }, streamId?: string,
+) => ({
+  ...openaiError(failure.retryAfter ? `${failure.message} (Retry-After: ${failure.retryAfter})` : failure.message, failure.code),
+  type: "error", status: failure.status,
+  ...(failure.retryAfter ? { retry_after: redactCredentials(failure.retryAfter) } : {}),
+  ...(streamId ? { stream_id: streamId } : {}),
+});
