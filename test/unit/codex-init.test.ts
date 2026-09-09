@@ -43,7 +43,7 @@ describe("Codex setup parity", () => {
   });
   it("does not overwrite reverse configuration when both clients use the same config file", async () => {
     const fs: InitFsDeps = { readFile: async () => null, exists: () => false, writeFile: async () => assert.fail() };
-    const plans = await planCodexSetup({ client: "both", port: 4141, settingsTarget: "local" },
+    const plans = await planCodexSetup({ client: "all", port: 4141, settingsTarget: "local" },
       { codexConfig: "/native/config.toml", subswitchConfig: "/project/subswitch.config.json", project: "/project" }, fs);
     assert.equal(plans.filter(plan => plan.path === "/project/subswitch.config.json").length, 1);
     assert.equal(JSON.parse(plans[0]!.content).codexIngress.claude.enabled, true);
@@ -52,7 +52,7 @@ describe("Codex setup parity", () => {
   it("deduplicates relative and absolute references to the same configuration", async () => {
     const fs: InitFsDeps = { readFile: async path => path === "/native/config.toml" ? 'openai_base_url = "https://trusted.example/v1"' : path.endsWith('subswitch.config.json') ? '{"codexIngress":{"allowInsecureBaseUrl":true}}' : null,
       exists: () => false, writeFile: async () => assert.fail() };
-    const plans = await planCodexSetup({ client: "both", port: 4141, settingsTarget: "local" },
+    const plans = await planCodexSetup({ client: "all", port: 4141, settingsTarget: "local" },
       { codexConfig: "/native/config.toml", subswitchConfig: "./subswitch.config.json", project: process.cwd() }, fs);
     const configWrites = plans.filter(plan => resolve(plan.path) === resolve("subswitch.config.json"));
     assert.equal(configWrites.length, 1);

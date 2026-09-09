@@ -19,6 +19,38 @@ const gather = async (events: Item[]) => {
 };
 
 describe("Claude streaming translation", () => {
+  it("can continue cancelled output using readable history without replaying unfinished thinking", async () => {
+    const config = options();
+    const emitted: Item[] = [];
+    for await (const event of translateClaudeStream(frames([
+      start,
+      { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "private unfinished", signature: "unfinished-signature" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 1, content_block: { type: "text", text: "partial answer" } },
+    ]), config)) {
+      emitted.push(event);
+      if (event["type"] === "response.output_text.delta") break;
+    }
+    const reasoning = emitted.find(event => event["type"] === "response.output_item.done")?.["item"] as Item;
+    const notice = "<turn_aborted>\nThe previous turn was interrupted on purpose. Tools may have partially executed.\n</turn_aborted>";
+    const next = reverseRequest({ model: "claude-sonnet-5", input: [
+      { role: "user", content: "Original question" }, reasoning,
+      { role: "assistant", content: [{ type: "output_text", text: "partial answer" }] },
+      { role: "developer", content: [{ type: "input_text", text: notice }] },
+      { role: "user", content: "Continue" },
+    ] }, [], config.state);
+    assert.deepEqual(next.body["messages"], [
+      { role: "user", content: [{ type: "text", text: "Original question" }] },
+      { role: "assistant", content: [{ type: "text", text: "partial answer" }] },
+      { role: "user", content: [{ type: "text", text: notice }, { type: "text", text: "Continue" }] },
+    ]);
+    assert.ok(!JSON.stringify(next.body).includes("unfinished"));
+    assert.throws(() => reverseRequest({ model: "claude-sonnet-5", input: [
+      { role: "user", content: "Original" }, { role: "developer", content: "Arbitrary new instructions" },
+    ] }, [], config.state), /mid_history_instructions_unimplemented/);
+    assert.throws(() => new ReverseState().open(String(reasoning["encrypted_content"])), /invalid_opaque_state/);
+  });
+
   it("emits text before upstream completion with stable item identities", async () => {
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });

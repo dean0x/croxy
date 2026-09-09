@@ -24,7 +24,7 @@ describe("Codex setup CLI", () => {
       assert.equal(await readFile(join(codex, "config.toml"), "utf8"), original);
       await assert.rejects(access(join(xdg, "subswitch", "config.json")));
       await assert.rejects(run("init", "--client", "codex"), error => !!(error as { stderr?: string }).stderr?.includes("--yes"));
-      await run("init", "--client", "both", "--yes");
+      await run("init", "--client", "all", "--yes");
       const native = await readFile(join(codex, "config.toml"), "utf8");
       assert.match(native, /openai_base_url = "http:\/\/127.0.0.1:4141\/codex\/backend-api\/codex"/);
       assert.ok(native.includes(original));
@@ -32,6 +32,11 @@ describe("Codex setup CLI", () => {
       assert.deepEqual(settings.permissions, { allow: ["Read"] }); assert.equal(settings.env.KEEP, "yes"); assert.equal(settings.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:4141");
       const models = JSON.parse((await run("models", "--client", "codex", "--json")).stdout);
       assert.equal(models.enabled, true); assert.ok(models.models.some((model: { aliases: string[] }) => model.aliases.includes("reviewer")));
+      const allModels = JSON.parse((await run("models", "--client", "all", "--json")).stdout);
+      const legacyModels = JSON.parse((await run("models", "--client", "both", "--json")).stdout);
+      assert.deepEqual(allModels, legacyModels);
+      assert.equal(allModels.client, "all");
+      assert.deepEqual(Object.keys(allModels.clients), ["claude-code", "codex"]);
       await run("init", "--client", "both", "--yes");
       assert.equal(await readFile(join(codex, "config.toml"), "utf8"), native);
     } finally { await rm(temp, { recursive: true, force: true }); }

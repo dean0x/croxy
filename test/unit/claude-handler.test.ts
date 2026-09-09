@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ClaudeHandler, ClaudeHttpError } from "../../src/claude-handler.js";
 import type { ClaudeAuth } from "../../src/claude-auth.js";
 import { loadConfig } from "../../src/config.js";
-import { ok } from "../../src/result.js";
+import { ok, err } from "../../src/result.js";
 
 const config = () => {
   const loaded = loadConfig({ configPath: "/fixture.json", readFile: () => "{}", env: {} });
@@ -24,6 +24,15 @@ const collect = async (handler: ClaudeHandler, signal = new AbortController().si
 };
 
 describe("Claude subscription request controls", () => {
+  it("reports relay credential unavailability without asking native Codex to refresh OpenAI", async () => {
+    const handler = new ClaudeHandler(config(), {
+      getCredentials: async () => err({ kind: "auth", message: "Sign in with Claude Code." }),
+      forceRefresh: async () => assert.fail("unexpected refresh"),
+    }, { log() {} }, async () => assert.fail("unavailable credentials must not reach inference"));
+    await assert.rejects(collect(handler), error => error instanceof ClaudeHttpError && error.status === 503 &&
+      error.code === "claude_auth_unavailable" && error.message === "Sign in with Claude Code.");
+  });
+
   // MUTATION CHECK: disabling the 401 refresh branch must fail both retry assertions.
   it("refreshes a rejected token once and pins subscription identity independently", async () => {
     let refreshes = 0;

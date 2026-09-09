@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { CLIENT_IDS, parseClientSelection, selectedClients, type ClientId, type ClientSelection as Client } from "./clients.js";
 import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { createColors } from "picocolors";
@@ -69,8 +70,9 @@ Flags (init):
                              or "shared" (.claude/settings.json)
 
 Flags (init, doctor, models):
-      --client <client>     "claude-code", "codex", or "both"
-                            init/models default to claude-code; doctor defaults to both
+      --client <client>     "claude-code", "codex", or "all"
+                            init/models default to claude-code; doctor defaults to all
+                            all selects supported clients; both is a compatibility alias
 
 Examples:
   subswitch serve                      # start proxy on port ${DEFAULT_PORT}
@@ -91,7 +93,6 @@ Environment:
 // Typed CLI command union (A3.18)
 // ---------------------------------------------------------------------------
 
-type Client = "claude-code" | "codex" | "both";
 type CliCommand =
   | { readonly kind: "help" }
   | { readonly kind: "version" }
@@ -143,9 +144,8 @@ const parseCliArgs = (argv: string[]): { ok: true; value: CliCommand } | { ok: f
     if (values.version === true) return { ok: true, value: { kind: "version" } };
 
     const command = positionals[0] ?? "serve";
-    if (values.client !== undefined && !["claude-code", "codex", "both"].includes(values.client))
-      return { ok: false, error: { message: "client must be claude-code, codex, or both" } };
-    const client = (values.client ?? (command === "doctor" ? "both" : "claude-code")) as Client;
+    const client = parseClientSelection(values.client ?? (command === "doctor" ? "all" : "claude-code"));
+    if (!client) return { ok: false, error: { message: `client must be ${CLIENT_IDS.join(", ")}, or all` } };
 
     // Unknown command
     if (command !== "serve" && command !== "doctor" && command !== "init" && command !== "models") {
@@ -351,7 +351,7 @@ const doctor = async (result: LoadConfigResult, client: Client): Promise<void> =
     // Only providers explicitly present in the loaded configuration sources can fail the exit code. (avoids PF-006)
     result.configuredProviders,
   );
-  if (client === "codex" || (client === "both" && result.config.codexIngress.claude.enabled)) {
+  if (client === "codex" || (client === "all" && result.config.codexIngress.claude.enabled)) {
     const { runCodexDoctor } = await import("./codex-doctor.js");
     process.exitCode = Math.max(Number(process.exitCode ?? 0), await runCodexDoctor(result.config, out, { color }));
   }
@@ -396,16 +396,16 @@ const modelsJson = (result: LoadConfigResult, client: Client): void => {
   const reverse = { kind: "models", schemaVersion: 2, client: "codex", subswitchVersion: SUBSWITCH_VERSION,
     fallbackProvider: "codex", enabled: config.codexIngress.enabled && config.codexIngress.claude.enabled,
     models: claudeModelRows(config.codexIngress.claude.aliases) };
-  if (client === "codex") { out(JSON.stringify(reverse)); return; }
-  if (client === "both") {
-    out(JSON.stringify({ kind: "models", schemaVersion: 2, client: "both", clients: { "claude-code": payload, codex: reverse } }));
+  const catalogs = { "claude-code": payload, codex: reverse } satisfies Record<ClientId, object>;
+  if (client === "all") {
+    out(JSON.stringify({ kind: "models", schemaVersion: 2, client: "all", clients: catalogs }));
     return;
   }
-  out(JSON.stringify(payload));
+  out(JSON.stringify(catalogs[client]));
 };
 
 const models = (config: Config, client: Client): void => {
-  if (client === "both") { models(config, "claude-code"); models(config, "codex"); return; }
+  if (client === "all") { for (const id of selectedClients(client)) models(config, id); return; }
   if (client === "codex") {
     out(`subswitch models — Codex → Claude (${config.codexIngress.enabled && config.codexIngress.claude.enabled ? "enabled" : "disabled"})`);
     for (const row of claudeModelRows(config.codexIngress.claude.aliases)) out(`  ${row.id}${row.aliases.length ? `  ${row.aliases.join(", ")}` : ""}`);
@@ -454,7 +454,7 @@ const runInit = async (command: Extract<CliCommand, { kind: "init" }>): Promise<
     if (!command.dryRun && decision === "refuse") { fail("no interactive terminal detected. Re-run with --yes, or preview with --dry-run."); return; }
     let port = command.flags.port;
     if (!command.dryRun && decision === "interactive") {
-      const prompts = await makeClackPrompts(); prompts.intro("SubSwitch Codex setup");
+      const prompts = await makeClackPrompts(); prompts.intro("SubSwitch setup");
       const selected = await prompts.text({ message: "Proxy port", initialValue: port ?? String(DEFAULT_PORT), validate: value => PortSchema.safeParse(value).success ? undefined : "Use a port between 1 and 65535" });
       if (prompts.isCancel(selected)) { prompts.cancel("Setup cancelled"); process.exitCode = 1; return; }
       port = String(selected);

@@ -21,9 +21,14 @@ export class ReverseState {
   seal(value: ClaudeReplay): string {
     return this.encrypt({ version: 1, provider: "claude", ...value });
   }
-  /** Issue a stable opaque handle before streaming text; commit only validated terminal content. */
+  /** Issue a stable handle before text, then attach opaque content only at a valid terminal. */
   begin(): { token: string; commit(value: ClaudeReplay): void } {
     const reference = randomUUID();
+    // Native Codex retains this handle after cancellation. Until completion it has
+    // no opaque content to replay; any readable partial assistant text stays in
+    // the client's ordinary history. Never replay unfinished thinking or tools.
+    // This placeholder shares the LRU budget: eviction/restart still fails closed.
+    this.references.put("replay", reference, { content: [], output: [] });
     return {
       token: this.encrypt({ version: 1, provider: "claude", reference }),
       commit: (value) => this.references.put("replay", reference, value),

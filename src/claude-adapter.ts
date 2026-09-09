@@ -132,9 +132,19 @@ const foldHistory = (input: Item[], system: Item[], tools: ReadonlyMap<string, T
     if (type === "message" || (type === undefined && entry["role"] !== undefined)) {
       const role = entry["role"];
       if (role === "system" || role === "developer") {
-        if (messages.length) return fail("mid_history_instructions_unimplemented");
         const blocks = content(entry["content"]);
         if (blocks.some((block) => block["type"] !== "text")) return fail("nontext_system");
+        if (messages.length) {
+          // Native Codex records cancellation as an ordered developer notice. It
+          // describes the interrupted turn, so retain it at that point in history;
+          // hoisting it into the system prompt would make it apply to later turns.
+          const text = blocks.length === 1 ? blocks[0]?.["text"] : undefined;
+          if (role === "developer" && typeof text === "string" && /^<turn_aborted>\n[^]*\n<\/turn_aborted>$/.test(text)) {
+            append("user", blocks);
+            continue;
+          }
+          return fail("mid_history_instructions_unimplemented");
+        }
         system.push(...blocks);
       } else if (role === "user" || role === "assistant") append(role, content(entry["content"]));
       else return fail("unsupported_message_role");

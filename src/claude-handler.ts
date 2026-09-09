@@ -32,7 +32,9 @@ export class ClaudeHandler {
   private async authorizedFetch(body: Item, signal: AbortSignal, model: string, trace: { sessionKey?: string }) {
     let credentials = await this.auth.getCredentials();
     signal.throwIfAborted();
-    if (!credentials.ok) throw new ClaudeHttpError(401, credentials.error.message, "claude_auth_unavailable");
+    // These are the relay's Claude credentials. A 401 would make native Codex
+    // refresh its unrelated OpenAI login instead of displaying the setup problem.
+    if (!credentials.ok) throw new ClaudeHttpError(503, credentials.error.message, "claude_auth_unavailable");
     let response: Response | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       const headers = {
@@ -55,7 +57,7 @@ export class ClaudeHandler {
       this.logger.log("info", CLAUDE_EVENTS.upstream401Refreshing, { model, ...trace });
       credentials = await this.auth.forceRefresh();
       signal.throwIfAborted();
-      if (!credentials.ok) throw new ClaudeHttpError(401, credentials.error.message, "claude_auth_unavailable");
+      if (!credentials.ok) throw new ClaudeHttpError(503, credentials.error.message, "claude_auth_unavailable");
     }
     if (!response) throw new ReverseContractError("claude_retry_bound");
     return { response, credentials };

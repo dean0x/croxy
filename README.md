@@ -119,8 +119,9 @@ Flags (init):
                              or "shared" (.claude/settings.json)
 
 Flags (init, doctor, models):
-      --client <client>     "claude-code", "codex", or "both"
-                            init/models default to claude-code; doctor defaults to both
+      --client <client>     "claude-code", "codex", or "all"
+                            init/models default to claude-code; doctor defaults to all
+                            all selects supported clients; both is a compatibility alias
 
 Examples:
   subswitch serve                      # start proxy on port 4141
@@ -193,8 +194,10 @@ subswitch models --client codex
 ```
 
 `init --client codex --dry-run` previews changes. Use `--yes` for non-interactive
-setup, or `--client both` to configure native Codex and the existing project-level
+setup, or `--client all` to configure native Codex and the existing project-level
 Claude Code integration together. The default `init` behavior remains Claude Code.
+`all` selects every client supported by this build (currently Claude Code and Codex);
+`both` remains accepted as a compatibility alias. New clients require their own adapters.
 
 Codex setup changes only the user-level `openai_base_url` value, preserving other
 TOML settings and comments. It writes SubSwitch's user config to
@@ -507,8 +510,8 @@ For `--client codex`, version 2 has this shape (model rows are abbreviated):
 {"kind":"models","schemaVersion":2,"client":"codex","subswitchVersion":"0.4.0","fallbackProvider":"codex","enabled":true,"models":[{"id":"claude-sonnet-5","provider":"claude","registered":true,"aliases":["sonnet"]}]}
 ```
 
-For `--client both`, version 2 uses `client: "both"` and a `clients` object:
-`{"kind":"models","schemaVersion":2,"client":"both","clients":{"claude-code":<version-1 object>,"codex":<version-2 Codex object>}}`.
+For `--client all`, version 2 uses `client: "all"` and a `clients` object:
+`{"kind":"models","schemaVersion":2,"client":"all","clients":{"claude-code":<version-1 object>,"codex":<version-2 Codex object>}}`.
 Branch on both `schemaVersion` and `client`. Codex rows contain `id`, `provider`,
 `registered`, and `aliases`; they do not use the version-1 row schema.
 
@@ -542,9 +545,14 @@ Branch on both `schemaVersion` and `client`. Codex rows contain `id`, `provider`
   in subscription mode and requires a matching native account.
 - **Translation:** Responses input becomes Messages history. Text streams incrementally;
   executable tool calls commit only after a valid terminal message. Response protocol
-  failures return 502; missing process-local continuation or thinking state returns 409.
+  failures return 502; missing process-local continuation or thinking state returns 409
+  with guidance to start a new conversation. Missing relay-side Claude credentials return
+  503 with Claude-specific sign-in guidance, avoiding an unrelated native OpenAI login refresh.
 - **State:** snapshots, authenticated thinking replay, and collaboration adaptation markers
-  share one bounded process-local LRU. Restart or eviction makes that state unavailable.
+  share one bounded process-local LRU. Interrupted streams retain an empty replay handle
+  so native cancellation notices and readable partial text can continue in the same
+  conversation. Unfinished thinking and tool calls are not replayed. Restart or eviction
+  makes that state unavailable.
 - **Collaboration:** when Claude routing is enabled, native collaboration definitions and
   structured calls are adapted for the whole Codex session, including OpenAI turns. The
   affected message arguments use the explicit plaintext tool contract. Existing opaque

@@ -362,7 +362,7 @@ IncomingMessage (Anthropic wire)
 ## Native Codex → Claude ingress (2026-09-08)
 
 The forward leg described above remains the default. `Config.codexIngress` adds an
-opt-in reverse leg, enabled by `init --client codex|both`. Claude models and aliases
+opt-in reverse leg, enabled by `init --client codex|all`. Claude models and aliases
 resolve by exact membership; `decideCodexRoute` consumes a typed resolution for both
 HTTP and WebSockets. `CodexGateway` wires `CodexUpstream`, `CodexWebSockets`, native auth,
 and `ClaudeHandler`. Both HTTP directions use `createRawHttpForwarder`; only complete
@@ -384,3 +384,8 @@ not impose TLS, HTTP-header, WebSocket-handshake, or established-stream deadline
 CLI `--client` defaults and merged configuration provenance are documented in the CLI UX
 KB. Both directions use `allowInsecureBaseUrl` for explicit custom-host trust. Native
 upgraded sockets keep a separate capacity slot until the client connection closes.
+
+Native cancellation keeps an empty, bounded replay placeholder until a valid terminal.
+The ordered `<turn_aborted>` notice and readable partial history can then continue
+without replaying unfinished thinking or tools. Missing relay-side Claude credentials
+return 503 so native Codex does not refresh its unrelated OpenAI login.

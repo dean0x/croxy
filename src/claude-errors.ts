@@ -95,6 +95,12 @@ export class ClaudeHttpError extends Error {
   }
 }
 
+const STATE_MESSAGES: Partial<Record<ClaudeErrorCode, string>> = {
+  missing_claude_replay_state: "Claude continuation state is no longer available in this SubSwitch process. Start a new conversation.",
+  missing_continuation_state: "This response's continuation state is no longer available. Start a new conversation.",
+  invalid_opaque_state: "Claude continuation state is invalid or belongs to a previous SubSwitch process. Start a new conversation.",
+};
+
 export const claudeFailure = (error: unknown) => {
   if (error instanceof ClaudeHttpError)
     return { status: error.status, message: error.message, code: error.code, retryAfter: error.retryAfter };
@@ -104,7 +110,7 @@ export const claudeFailure = (error: unknown) => {
   return {
     status: CLAUDE_ERROR_STATUS[code],
     code,
-    message: `SubSwitch could not translate this request (${code}).`,
+    message: STATE_MESSAGES[code] ?? `SubSwitch could not translate this request (${code}).`,
     retryAfter: undefined,
   };
 };

@@ -72,7 +72,7 @@ export function planCodexEndpoint(
 
 export async function planCodexSetup(
   options: {
-    client: "codex" | "both";
+    client: "codex" | "all";
     port: number;
     settingsTarget: SettingsTarget;
     mode?: "subscription" | "api";
@@ -148,7 +148,7 @@ export async function planCodexSetup(
       { path: paths.subswitchConfig, content: configContent, preview: configContent.trimEnd() },
     ];
     let forwardSettings: SetupWrite | undefined;
-    if (options.client === "both") {
+    if (options.client === "all") {
       const projectConfigPath = join(paths.project, "subswitch.config.json");
       const sameConfig = resolve(projectConfigPath) === resolve(paths.subswitchConfig);
       const projectConfig = planConfigWrite(
@@ -203,7 +203,7 @@ export async function planCodexSetup(
 
 export async function runCodexInit(
   options: {
-    client: "codex" | "both";
+    client: "codex" | "all";
     port?: string;
     settingsTarget?: string;
     dryRun: boolean;
@@ -261,7 +261,7 @@ export async function runCodexInit(
     write(
       options.dryRun
         ? "[dry-run] No files written."
-        : "Next: run subswitch serve, then subswitch doctor --client codex. Native agents can use model sonnet, opus, or fable.",
+        : `Next: run subswitch serve, then subswitch doctor --client ${options.client}. Native agents can use model sonnet, opus, or fable.`,
     );
     return ok(undefined);
   } catch {

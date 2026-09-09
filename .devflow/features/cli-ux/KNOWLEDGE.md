@@ -101,7 +101,7 @@ Key exports: `PROVIDER_IDS`, `ProviderId`, `AliasesByProvider`, `MODEL_REGISTRY`
 `parseCliArgs` returns a discriminated `CliCommand` union. Flag sets per command:
 
 - `serve`: `verbose`, `quiet`, `port`
-- `doctor`: `client` (defaults to `both`; reverse checks run when configured)
+- `doctor`: `client` (defaults to `all`; reverse checks run when configured)
 - `models`: `json`, `client` (defaults to `claude-code`)
 - `init`: `yes`, `dry-run`, `port`, `settings-target`, `client` (defaults to `claude-code`)
 
@@ -332,13 +332,16 @@ Emits to stderr. Format: `[HH:MM:SS] level=<L> event=<E> key=value …`. Fields 
 ## Bidirectional ingress and configuration (2026-09-08)
 
 `Config.codexIngress` enables native Codex HTTP/WebSocket ingress; its `claude` slice
-controls Claude translation. `init --client codex|both` plans native TOML and SubSwitch
+controls Claude translation. `init --client codex|all` plans native TOML and SubSwitch
 writes through `codex-init.ts` Result-returning helpers; custom upstream trust is explicit.
 `doctor --client codex` checks native setup/auth/connectivity without refresh. Default
-`doctor` selects `both` but skips disabled reverse checks. `models --json` stays version 1
-for `claude-code`; version 2 has `client: codex|both` and separately documented shapes.
+`doctor` selects `all` but skips disabled reverse checks. `models --json` stays version 1
+for `claude-code`; version 2 has `client: codex|all` and separately documented shapes.
 
 Configuration precedence is explicit `SUBSWITCH_CONFIG` (no merge), otherwise project
 `subswitch.config.json` over `$XDG_CONFIG_HOME/subswitch/config.json` over defaults.
 `LoadConfigResult.configPaths` lists every loaded source; legacy/unknown-provider errors
 name the source containing the offending key. `configuredProviders` reflects all sources.
+
+`src/clients.ts` owns the supported-client IDs and the `all` selector. Legacy `both`
+normalizes to `all`; model JSON uses the canonical `client: "all"` discriminator.

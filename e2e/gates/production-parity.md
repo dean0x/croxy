@@ -5,6 +5,12 @@ The implementation is now wired into `serve`, setup, model discovery/listing, an
 doctor. It remains opt-in; development has not activated it in the user's real
 native configuration.
 
+## Latest usability acceptance
+
+The [2026-09-09 usability run](usability-2026-09-09.md) exercises live native coding,
+cancellation/recovery, mixed-model concurrency through one proxy, setup, failures,
+and genuine Claude credential refresh. It also records the defects found and corrected.
+
 ## Live native acceptance
 
 On Codex CLI 0.153.4 with subscription authentication and real upstream model
@@ -78,7 +84,7 @@ subscription/extra-usage quota was charged.
 
 ## Automated and packaging verification
 
-Typechecking and all **825 tests** passed. The installed-tarball smoke check
+Typechecking and all **852 tests** passed after the usability fixes. The installed-tarball smoke check
 validated both the unchanged forward setup and the new `init --client both`,
 `models --client codex --json`, and reverse-enabled server health. The existing
 SSE benchmark passed all three stream shapes within its unchanged linearity bound.

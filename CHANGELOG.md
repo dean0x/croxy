@@ -12,9 +12,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   models continue to OpenAI and Codex retains native agents, tools and permissions.
 - Subscription authentication, credential refresh, readable collaboration messages,
   streamed/non-stream responses, prompt caching and bounded process-local replay.
-- `init`, `doctor` and `models --client codex|both`, native model discovery, and a
+- `init`, `doctor` and `models --client codex|all`, native model discovery, and a
   user configuration fallback. Existing Claude Code setup remains the default.
 - Live native acceptance runners and shared parity follow-ups in issues #45–#48.
+
+- `--client all` selects all supported clients; `both` remains a compatibility alias.
 
 ### Changed
 
@@ -29,6 +31,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Native Codex setup requires explicit trust for a custom upstream host before it writes files.
 
 ### Fixed
+
+- Native Codex conversations can continue after cancelling a Claude response; pending
+  replay handles and ordered cancellation notices no longer cause 409/400 failures.
+- Missing relay-side Claude credentials produce Claude-specific setup guidance without
+  triggering native Codex to refresh its unrelated OpenAI login. Lost continuation
+  errors now explain that a new conversation is required.
 
 - Scope native credential substitution to exact Codex endpoints and redact synthesized
   OpenAI errors at the JSON, SSE, and WebSocket render boundaries.
