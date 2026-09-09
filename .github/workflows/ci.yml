@@ -15,13 +15,25 @@ concurrency:
 
 jobs:
   check:
-    name: check (${{ matrix.os }}, Node ${{ matrix.node }})
+    name: ${{ matrix.check_name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        node: [22.15.0, 24]
+        include:
+          # Preserve the names required by main's branch protection.
+          - os: ubuntu-latest
+            node: "22.15.0"
+            check_name: check (ubuntu-latest)
+          - os: macos-latest
+            node: "22.15.0"
+            check_name: check (macos-latest)
+          - os: ubuntu-latest
+            node: "24"
+            check_name: check (ubuntu-latest, Node 24)
+          - os: macos-latest
+            node: "24"
+            check_name: check (macos-latest, Node 24)
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
